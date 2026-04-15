@@ -10,7 +10,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-print("RUNNING VERSION: structured-prizes-3")
+print("RUNNING VERSION: structured-prizes-4")
 
 # =========================
 # ENV / SECRETS
@@ -275,6 +275,24 @@ def get_sizes_for_firm_and_type(prop_firm_name: str, account_type_name: str) -> 
 
 
 # =========================
+# UNKNOWN PRIZE HELPER
+# =========================
+UNKNOWN_PRIZE_LABEL = "Unknown Prize"
+
+def is_unknown_prize(prop_firm: str) -> bool:
+    return prop_firm.strip() == UNKNOWN_PRIZE_LABEL
+
+def make_unknown_resolved() -> dict:
+    return {
+        "display_name": UNKNOWN_PRIZE_LABEL,
+        "prize_catalog_id": None,
+        "prop_firm_id": None,
+        "account_type_id": None,
+        "account_size_id": None,
+    }
+
+
+# =========================
 # PROMPT HELPERS
 # =========================
 def load_prompt_config():
@@ -298,7 +316,7 @@ def render_prompt(template_key: str, show: str | None = None, **kwargs) -> str:
 def get_prompt_for_prize(prize: str, show: str | None = None) -> str:
     p = prize.strip()
 
-    if p == "Unknown Prize":
+    if p == UNKNOWN_PRIZE_LABEL:
         return render_prompt("unknown", show=show)
 
     if p.startswith("MOT Indicator"):
@@ -401,7 +419,6 @@ def save_data(data: dict):
                     history = json.dumps(entry.get("history") or [])
 
                     if key in existing:
-                        # FIX: UPDATE now includes all four catalog ID columns
                         cur.execute("""
                             UPDATE winners SET
                                 status = %s,
@@ -965,8 +982,6 @@ async def apply_prize_update_to_db(
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # FIX: match on bundle_id + prize only (no ticket_channel_id),
-                # and check rowcount to confirm something actually updated
                 cur.execute("""
                     UPDATE winners SET
                         prize = %s,
@@ -2094,12 +2109,17 @@ tree = bot.tree
 # AUTOCOMPLETE
 # =========================
 async def prop_firm_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    # Unknown Prize always appears first if it matches the current input
+    choices = []
+    if current.lower() in "unknown prize":
+        choices.append(app_commands.Choice(name="Unknown Prize", value="Unknown Prize"))
     firms = get_active_prop_firms()
-    return [
+    choices += [
         app_commands.Choice(name=f["name"], value=f["name"])
         for f in firms
         if current.lower() in f["name"].lower()
-    ][:25]
+    ]
+    return choices[:25]
 
 
 async def show_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
@@ -2113,7 +2133,7 @@ async def show_autocomplete(interaction: discord.Interaction, current: str) -> l
 # Single-field autocomplete (used by /win, /yt, /track)
 async def account_type_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm or ""
-    if not prop_firm:
+    if not prop_firm or is_unknown_prize(prop_firm):
         return []
     types = get_account_types_for_firm(prop_firm)
     return [
@@ -2126,7 +2146,7 @@ async def account_type_autocomplete(interaction: discord.Interaction, current: s
 async def account_size_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm or ""
     account_type = interaction.namespace.account_type or ""
-    if not prop_firm or not account_type:
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [
@@ -2139,7 +2159,7 @@ async def account_size_autocomplete(interaction: discord.Interaction, current: s
 # Numbered autocomplete (used by /multi and /ytmulti)
 async def account_type_autocomplete_1(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_1 or ""
-    if not prop_firm:
+    if not prop_firm or is_unknown_prize(prop_firm):
         return []
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
@@ -2148,7 +2168,7 @@ async def account_type_autocomplete_1(interaction: discord.Interaction, current:
 async def account_size_autocomplete_1(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_1 or ""
     account_type = interaction.namespace.account_type_1 or ""
-    if not prop_firm or not account_type:
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
@@ -2156,7 +2176,7 @@ async def account_size_autocomplete_1(interaction: discord.Interaction, current:
 
 async def account_type_autocomplete_2(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_2 or ""
-    if not prop_firm:
+    if not prop_firm or is_unknown_prize(prop_firm):
         return []
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
@@ -2165,7 +2185,7 @@ async def account_type_autocomplete_2(interaction: discord.Interaction, current:
 async def account_size_autocomplete_2(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_2 or ""
     account_type = interaction.namespace.account_type_2 or ""
-    if not prop_firm or not account_type:
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
@@ -2173,7 +2193,7 @@ async def account_size_autocomplete_2(interaction: discord.Interaction, current:
 
 async def account_type_autocomplete_3(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_3 or ""
-    if not prop_firm:
+    if not prop_firm or is_unknown_prize(prop_firm):
         return []
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
@@ -2182,10 +2202,30 @@ async def account_type_autocomplete_3(interaction: discord.Interaction, current:
 async def account_size_autocomplete_3(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_3 or ""
     account_type = interaction.namespace.account_type_3 or ""
-    if not prop_firm or not account_type:
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
+
+
+# =========================
+# PRIZE RESOLUTION HELPER
+# =========================
+def resolve_prize(prop_firm: str, account_type: str, account_size: str) -> tuple[dict | None, str | None]:
+    """
+    Returns (resolved_dict, error_message).
+    For Unknown Prize, returns a safe stub dict with no catalog IDs.
+    For normal prizes, resolves from catalog or returns None with an error.
+    """
+    if is_unknown_prize(prop_firm):
+        return make_unknown_resolved(), None
+    resolved = resolve_prize_from_catalog(prop_firm, account_type, account_size)
+    if not resolved:
+        return None, (
+            f"❌ No prize found for **{prop_firm} / {account_type} / {account_size}**. "
+            "Make sure you selected from the autocomplete options."
+        )
+    return resolved, None
 
 
 # =========================
@@ -2400,9 +2440,9 @@ async def create_manual_ticket(
 @tree.command(name="win", description="Log one Discord winner and create a ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     user="Winner",
-    prop_firm="Prop firm (e.g. Lucid, Tradeify, MFF)",
-    account_type="Account type (e.g. Flex, Select, Rapid)",
-    account_size="Account size (e.g. 50k, 100k)",
+    prop_firm="Prop firm — or select 'Unknown Prize' if prize is not yet known",
+    account_type="Account type (skip if Unknown Prize)",
+    account_size="Account size (skip if Unknown Prize)",
     quantity="Number of this prize won (default 1)",
     code="Optional giveaway code",
     show="Show the prize was won on",
@@ -2418,8 +2458,8 @@ async def winner(
     interaction: discord.Interaction,
     user: discord.Member,
     prop_firm: str,
-    account_type: str,
-    account_size: str,
+    account_type: str = "",
+    account_size: str = "",
     quantity: int = 1,
     code: str | None = None,
     show: str | None = None,
@@ -2430,14 +2470,12 @@ async def winner(
     if quantity < 1 or quantity > 10:
         await interaction.response.send_message("❌ Quantity must be between 1 and 10.", ephemeral=True)
         return
-    resolved = resolve_prize_from_catalog(prop_firm, account_type, account_size)
-    if not resolved:
-        await interaction.response.send_message(
-            f"❌ No prize found for **{prop_firm} / {account_type} / {account_size}**. "
-            "Make sure you selected from the autocomplete options.",
-            ephemeral=True
-        )
+
+    resolved, error = resolve_prize(prop_firm, account_type, account_size)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
+
     prize = resolved["display_name"]
     guild = interaction.guild
     if guild is None:
@@ -2484,72 +2522,15 @@ async def winner(
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="unknown", description="Log a winner with an unknown prize and create a ticket", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(
-    user="Winner",
-    code="Optional giveaway code",
-    show="Show the prize was won on",
-    notes="Optional notes"
-)
-@app_commands.autocomplete(show=show_autocomplete)
-async def unknown_prize(
-    interaction: discord.Interaction,
-    user: discord.Member,
-    code: str | None = None,
-    show: str | None = None,
-    notes: str | None = None
-):
-    if not await ensure_mod(interaction):
-        return
-    prize = "Unknown Prize"
-    guild = interaction.guild
-    if guild is None:
-        await interaction.response.send_message("❌ Must be used inside the server.", ephemeral=True)
-        return
-    if user.id in ticket_creation_in_progress:
-        await interaction.response.send_message("⏳ A ticket is already being created for this user.", ephemeral=True)
-        return
-    ticket_creation_in_progress.add(user.id)
-    lock = get_winner_lock(user.id)
-    await interaction.response.defer(ephemeral=True)
-    try:
-        async with lock:
-            existing = find_any_open_ticket_for_user(guild, user)
-            if existing is not None:
-                await interaction.followup.send(f"❌ {user.mention} already has an open ticket: {existing.mention}", ephemeral=True)
-                return
-            try:
-                ticket_channel, bundle_id = await create_giveaway_ticket_and_log(
-                    interaction=interaction,
-                    guild=guild,
-                    user=user,
-                    selected_prizes=[prize],
-                    code=code,
-                    show=show,
-                    notes=notes,
-                )
-            except Exception as e:
-                await interaction.followup.send(f"❌ {e}", ephemeral=True)
-                return
-    finally:
-        ticket_creation_in_progress.discard(user.id)
-    msg = f"✅ {user.mention} — Unknown Prize logged.\n🎟️ Ticket created: {ticket_channel.mention}\n🧾 Bundle ID: `{bundle_id}`"
-    if show:
-        msg += f"\n📺 Show: **{show}**"
-    if notes:
-        msg += f"\n📝 Notes: {notes}"
-    await interaction.followup.send(msg, ephemeral=True)
-
-
 @tree.command(name="multi", description="Log a Discord winner with multiple prizes and create one ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     user="Winner",
-    prop_firm_1="First prize prop firm",
-    account_type_1="First prize account type",
-    account_size_1="First prize account size",
-    prop_firm_2="Second prize prop firm",
-    account_type_2="Second prize account type",
-    account_size_2="Second prize account size",
+    prop_firm_1="First prize prop firm (or 'Unknown Prize')",
+    account_type_1="First prize account type (skip if Unknown Prize)",
+    account_size_1="First prize account size (skip if Unknown Prize)",
+    prop_firm_2="Second prize prop firm (or 'Unknown Prize')",
+    account_type_2="Second prize account type (skip if Unknown Prize)",
+    account_size_2="Second prize account size (skip if Unknown Prize)",
     prop_firm_3="Third prize prop firm (optional)",
     account_type_3="Third prize account type (optional)",
     account_size_3="Third prize account size (optional)",
@@ -2572,39 +2553,40 @@ async def multiwinner(
     interaction: discord.Interaction,
     user: discord.Member,
     prop_firm_1: str,
-    account_type_1: str,
-    account_size_1: str,
     prop_firm_2: str,
-    account_type_2: str,
-    account_size_2: str,
+    account_type_1: str = "",
+    account_size_1: str = "",
+    account_type_2: str = "",
+    account_size_2: str = "",
     prop_firm_3: str | None = None,
-    account_type_3: str | None = None,
-    account_size_3: str | None = None,
+    account_type_3: str = "",
+    account_size_3: str = "",
     code: str | None = None,
     show: str | None = None
 ):
     if not await ensure_mod(interaction):
         return
-    prize_inputs = [
+
+    raw_inputs = [
         (prop_firm_1, account_type_1, account_size_1),
         (prop_firm_2, account_type_2, account_size_2),
     ]
-    if prop_firm_3 and account_type_3 and account_size_3:
-        prize_inputs.append((prop_firm_3, account_type_3, account_size_3))
+    if prop_firm_3:
+        raw_inputs.append((prop_firm_3, account_type_3, account_size_3))
+
     resolved_prizes = []
-    for pf, at, sz in prize_inputs:
-        r = resolve_prize_from_catalog(pf, at, sz)
-        if not r:
-            await interaction.response.send_message(
-                f"❌ No prize found for **{pf} / {at} / {sz}**. Make sure you selected from the autocomplete options.",
-                ephemeral=True
-            )
+    for pf, at, sz in raw_inputs:
+        r, error = resolve_prize(pf, at, sz)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         resolved_prizes.append(r)
+
     selected_prizes = dedupe_preserve_order([r["display_name"] for r in resolved_prizes])
     if len(selected_prizes) < 2:
         await interaction.response.send_message("❌ Use /win for a single prize, or select at least two different prizes here.", ephemeral=True)
         return
+
     guild = interaction.guild
     if guild is None:
         await interaction.response.send_message("❌ Must be used inside the server.", ephemeral=True)
@@ -2648,9 +2630,9 @@ async def multiwinner(
 @tree.command(name="yt", description="Log a YouTube winner without creating a ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     youtube_name="YouTube winner name or handle",
-    prop_firm="Prop firm",
-    account_type="Account type",
-    account_size="Account size",
+    prop_firm="Prop firm — or select 'Unknown Prize' if prize is not yet known",
+    account_type="Account type (skip if Unknown Prize)",
+    account_size="Account size (skip if Unknown Prize)",
     code="Optional giveaway code",
     notes="Optional notes",
     show="Show the prize was won on"
@@ -2665,8 +2647,8 @@ async def youtube(
     interaction: discord.Interaction,
     youtube_name: str,
     prop_firm: str,
-    account_type: str,
-    account_size: str,
+    account_type: str = "",
+    account_size: str = "",
     code: str | None = None,
     notes: str | None = None,
     show: str | None = None
@@ -2679,14 +2661,12 @@ async def youtube(
     if notes and len(notes) > 500:
         await interaction.response.send_message("❌ Notes must be 500 characters or less.", ephemeral=True)
         return
-    resolved = resolve_prize_from_catalog(prop_firm, account_type, account_size)
-    if not resolved:
-        await interaction.response.send_message(
-            f"❌ No prize found for **{prop_firm} / {account_type} / {account_size}**. "
-            "Make sure you selected from the autocomplete options.",
-            ephemeral=True
-        )
+
+    resolved, error = resolve_prize(prop_firm, account_type, account_size)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
+
     prize = resolved["display_name"]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bundle_id = uuid.uuid4().hex[:8]
@@ -2727,12 +2707,12 @@ async def youtube(
 @tree.command(name="ytmulti", description="Log a YouTube winner with multiple prizes without creating a ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     youtube_name="YouTube winner name or handle",
-    prop_firm_1="First prize prop firm",
-    account_type_1="First prize account type",
-    account_size_1="First prize account size",
-    prop_firm_2="Second prize prop firm",
-    account_type_2="Second prize account type",
-    account_size_2="Second prize account size",
+    prop_firm_1="First prize prop firm (or 'Unknown Prize')",
+    account_type_1="First prize account type (skip if Unknown Prize)",
+    account_size_1="First prize account size (skip if Unknown Prize)",
+    prop_firm_2="Second prize prop firm (or 'Unknown Prize')",
+    account_type_2="Second prize account type (skip if Unknown Prize)",
+    account_size_2="Second prize account size (skip if Unknown Prize)",
     prop_firm_3="Third prize prop firm (optional)",
     account_type_3="Third prize account type (optional)",
     account_size_3="Third prize account size (optional)",
@@ -2756,14 +2736,14 @@ async def ytmulti(
     interaction: discord.Interaction,
     youtube_name: str,
     prop_firm_1: str,
-    account_type_1: str,
-    account_size_1: str,
     prop_firm_2: str,
-    account_type_2: str,
-    account_size_2: str,
+    account_type_1: str = "",
+    account_size_1: str = "",
+    account_type_2: str = "",
+    account_size_2: str = "",
     prop_firm_3: str | None = None,
-    account_type_3: str | None = None,
-    account_size_3: str | None = None,
+    account_type_3: str = "",
+    account_size_3: str = "",
     code: str | None = None,
     notes: str | None = None,
     show: str | None = None
@@ -2776,25 +2756,26 @@ async def ytmulti(
     if notes and len(notes) > 500:
         await interaction.response.send_message("❌ Notes must be 500 characters or less.", ephemeral=True)
         return
-    prize_inputs = [
+
+    raw_inputs = [
         (prop_firm_1, account_type_1, account_size_1),
         (prop_firm_2, account_type_2, account_size_2),
     ]
-    if prop_firm_3 and account_type_3 and account_size_3:
-        prize_inputs.append((prop_firm_3, account_type_3, account_size_3))
+    if prop_firm_3:
+        raw_inputs.append((prop_firm_3, account_type_3, account_size_3))
+
     resolved_prizes = []
-    for pf, at, sz in prize_inputs:
-        r = resolve_prize_from_catalog(pf, at, sz)
-        if not r:
-            await interaction.response.send_message(
-                f"❌ No prize found for **{pf} / {at} / {sz}**. Make sure you selected from the autocomplete options.",
-                ephemeral=True
-            )
+    for pf, at, sz in raw_inputs:
+        r, error = resolve_prize(pf, at, sz)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
             return
         resolved_prizes.append(r)
+
     if len(resolved_prizes) < 2:
         await interaction.response.send_message("❌ Select at least two prizes.", ephemeral=True)
         return
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bundle_id = uuid.uuid4().hex[:8]
     backend_lines = []
@@ -2839,9 +2820,9 @@ async def ytmulti(
 @tree.command(name="track", description="Log a Discord winner without creating a ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     user="Winner",
-    prop_firm="Prop firm",
-    account_type="Account type",
-    account_size="Account size",
+    prop_firm="Prop firm — or select 'Unknown Prize' if prize is not yet known",
+    account_type="Account type (skip if Unknown Prize)",
+    account_size="Account size (skip if Unknown Prize)",
     code="Optional giveaway code",
     notes="Optional notes",
     show="Show the prize was won on"
@@ -2856,22 +2837,20 @@ async def track(
     interaction: discord.Interaction,
     user: discord.Member,
     prop_firm: str,
-    account_type: str,
-    account_size: str,
+    account_type: str = "",
+    account_size: str = "",
     code: str | None = None,
     notes: str | None = None,
     show: str | None = None
 ):
     if not await ensure_mod(interaction):
         return
-    resolved = resolve_prize_from_catalog(prop_firm, account_type, account_size)
-    if not resolved:
-        await interaction.response.send_message(
-            f"❌ No prize found for **{prop_firm} / {account_type} / {account_size}**. "
-            "Make sure you selected from the autocomplete options.",
-            ephemeral=True
-        )
+
+    resolved, error = resolve_prize(prop_firm, account_type, account_size)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
         return
+
     prize = resolved["display_name"]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     bundle_id = uuid.uuid4().hex[:8]
