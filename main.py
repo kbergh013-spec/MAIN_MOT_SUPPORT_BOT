@@ -2363,6 +2363,7 @@ async def ensure_support_panel():
 # =========================
 class GiveawayBot(commands.Bot):
     async def setup_hook(self):
+        init_db()
         self.add_view(GiveawayTicketControls())
         self.add_view(SupportTicketControls())
         self.add_view(OpenSupportTicketView())
@@ -3470,7 +3471,6 @@ async def stats(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     try:
-        init_db()
         await tree.sync(guild=discord.Object(id=GUILD_ID))
         print(f"Logged in as {bot.user}")
         print("Slash commands synced.")
