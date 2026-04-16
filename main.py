@@ -1963,7 +1963,7 @@ class ModFaqSendButton(discord.ui.Button):
             await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
             return
         message_content = f"**{self.question}**\n\n{self.answer}"
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer(thinking=False)
         if len(message_content) <= 2000:
             await channel.send(message_content)
         else:
@@ -1975,7 +1975,7 @@ class ModFaqSendButton(discord.ui.Button):
         await interaction.followup.send(
             content=f"✅ Sent **{self.question[:60]}** to the ticket.",
             ephemeral=True
-        ) 
+        )
 
     
 # =========================
