@@ -1920,13 +1920,13 @@ class ModFaqCategoryButton(discord.ui.Button):
         )
         self.category_id = category_id
 
-    async def callback(self, interaction: discord.Interaction):
+async def callback(self, interaction: discord.Interaction):
         view = ModFaqAnswerView(category_id=self.category_id, category_name=self.label)
-        await interaction.response.edit_message(
+        await interaction.response.send_message(
             content=f"**{self.label} FAQs** — click a question to send it to the ticket:",
-            view=view
+            view=view,
+            ephemeral=True
         )
-
 
 class ModFaqAnswerView(discord.ui.View):
     """Ephemeral question picker for mods. Clicking sends the answer publicly."""
