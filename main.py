@@ -1954,20 +1954,16 @@ class ModFaqSendButton(discord.ui.Button):
         self.question = question
         self.answer = answer
 
-async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction: discord.Interaction):
         if not isinstance(interaction.user, discord.Member) or not user_is_mod(interaction.user):
             await interaction.response.send_message("❌ Only mods can send FAQs to the ticket.", ephemeral=True)
             return
         channel = interaction.channel
-        print(f"[FAQ SEND] question={self.question[:40]} channel={channel} user={interaction.user}")
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
             return
         message_content = f"**{self.question}**\n\n{self.answer}"
-        await interaction.response.send_message(
-            content=f"✅ Sent **{self.question[:60]}** to the ticket.",
-            ephemeral=True
-        )
+        await interaction.response.defer(ephemeral=True)
         if len(message_content) <= 2000:
             await channel.send(message_content)
         else:
@@ -1975,7 +1971,11 @@ async def callback(self, interaction: discord.Interaction):
             remaining = message_content[2000:]
             while remaining:
                 await channel.send(remaining[:2000])
-                remaining = remaining[2000:]   
+                remaining = remaining[2000:]
+        await interaction.followup.send(
+            content=f"✅ Sent **{self.question[:60]}** to the ticket.",
+            ephemeral=True
+        ) 
 
     
 # =========================
