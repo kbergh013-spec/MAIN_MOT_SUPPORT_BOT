@@ -3610,7 +3610,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # =========================
 # /faq ADMIN COMMANDS
 # =========================
-faq_group = app_commands.Group(name="faq", description="Manage FAQ entries", guild=discord.Object(id=GUILD_ID))
+faq_group = app_commands.Group(name="faq", description="Manage FAQ entries")
 faq_category_group = app_commands.Group(name="category", description="Manage FAQ categories", parent=faq_group)
 
 
@@ -4401,7 +4401,7 @@ async def faq_category_delete(interaction: discord.Interaction):
 
 
 # Register the /faq command group
-tree.add_command(faq_group)
+tree.add_command(faq_group, guild=discord.Object(id=GUILD_ID))
 
 
 bot.run(TOKEN)
