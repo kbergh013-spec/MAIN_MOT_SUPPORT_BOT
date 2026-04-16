@@ -2330,7 +2330,6 @@ class SupportTicketControls(discord.ui.View):
                 view=view,
                 ephemeral=True
             )
-            )
         else:
             view = FaqCategoryView()
             await interaction.response.send_message(
