@@ -2348,8 +2348,6 @@ class OpenSupportTicketView(discord.ui.View):
 
     @discord.ui.button(label="Open Support Ticket", style=discord.ButtonStyle.primary, custom_id="open_support_ticket")
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.response.is_done():
-            return
         guild = interaction.guild
         user = interaction.user
         if guild is None or not isinstance(user, discord.Member):
@@ -2361,8 +2359,12 @@ class OpenSupportTicketView(discord.ui.View):
         if user.id in ticket_creation_in_progress:
             await interaction.response.send_message("Already opening a ticket for you, please wait.", ephemeral=True)
             return
+
+        # Defer immediately — this acknowledges the interaction within Discord's 3-second
+        # window and gives us up to 15 minutes to follow up. All subsequent replies use
+        # interaction.followup instead of interaction.response.
+        await interaction.response.defer(ephemeral=True)
         ticket_creation_in_progress.add(user.id)
-        await interaction.response.send_message("Opening your ticket, one moment...", ephemeral=True)
         try:
             existing = find_any_open_ticket_for_user(guild, user)
             if existing is not None:
@@ -2383,7 +2385,7 @@ class OpenSupportTicketView(discord.ui.View):
                 await interaction.followup.send("Mod role not found. Check MOD_ROLE_ID.", ephemeral=True)
                 return
 
-            # NEW: Draw a concurrency-safe sequential ticket number from Postgres sequence,
+            # Draw a concurrency-safe sequential ticket number from Postgres sequence,
             # then build the channel name as <ticket_number>-<sanitized_username>.
             ticket_number = next_ticket_number()
             sanitized = sanitize_username_for_channel(user.name)
@@ -2414,7 +2416,7 @@ class OpenSupportTicketView(discord.ui.View):
             except Exception as e:
                 print(f"Failed to pin support control message: {e}")
 
-            # NEW: First message shows Ticket # and username prominently at the top.
+            # First message shows Ticket # and username prominently at the top.
             await ticket_channel.send(
                 f"**Ticket #{ticket_number}**\n"
                 f"**User:** {user.name}\n\n"
@@ -2430,8 +2432,9 @@ class OpenSupportTicketView(discord.ui.View):
                 "If you won a prize outside of Discord, click **Claim My Prize**.",
                 view=FaqCategoryView()
             )
-            await interaction.edit_original_response(
-                content=f"Your support ticket has been created: {ticket_channel.mention}"
+            await interaction.followup.send(
+                f"Your support ticket has been created: {ticket_channel.mention}",
+                ephemeral=True
             )
         finally:
             ticket_creation_in_progress.discard(user.id)
@@ -3055,6 +3058,166 @@ async def multiwinner(
     if show:
         msg += f"\n📺 Show: **{show}**"
     await interaction.followup.send(msg, ephemeral=True)
+
+
+# =========================
+# /send AND /multisend
+# Send a prize prompt into an existing support ticket — no DB logging, no new channel.
+# Must be used inside a support ticket channel. Mirrors /win and /multi dropdowns exactly.
+# =========================
+
+@tree.command(name="send", description="Send a single prize prompt into this support ticket", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    prop_firm="Prop firm — or select 'Unknown Prize' if prize is not yet known",
+    account_type="Account type (skip if Unknown Prize)",
+    account_size="Account size (skip if Unknown Prize)",
+    quantity="Number of this prize won (default 1)",
+    code="Optional giveaway code",
+    show="Show the prize was won on"
+)
+@app_commands.autocomplete(
+    prop_firm=prop_firm_autocomplete,
+    account_type=account_type_autocomplete,
+    account_size=account_size_autocomplete,
+    show=show_autocomplete
+)
+async def send_prompt(
+    interaction: discord.Interaction,
+    prop_firm: str,
+    account_type: str = "",
+    account_size: str = "",
+    quantity: int = 1,
+    code: str | None = None,
+    show: str | None = None
+):
+    if not await ensure_mod(interaction):
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel) or not is_support_ticket_channel(channel):
+        await interaction.response.send_message(
+            "❌ `/send` can only be used inside a support ticket channel.", ephemeral=True
+        )
+        return
+    if quantity < 1 or quantity > 10:
+        await interaction.response.send_message("❌ Quantity must be between 1 and 10.", ephemeral=True)
+        return
+
+    resolved, error = resolve_prize(prop_firm, account_type, account_size)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+
+    prize = resolved["display_name"]
+    qty_text = f" (x{quantity})" if quantity > 1 else ""
+
+    # Build the same header + prompt body that /win generates
+    header_lines = [f"**Prize:** {prize}{qty_text}"]
+    if show:
+        header_lines.append(f"**Show:** {show}")
+    if code:
+        header_lines.append(f"**Code:** `{code}`")
+    header = "\n".join(header_lines)
+
+    prompt_body = get_prompt_for_prize(prize, show=show)
+
+    await interaction.response.defer(ephemeral=True)
+    await channel.send(header)
+    await send_long_message(channel, prompt_body)
+    await interaction.followup.send(
+        f"✅ Prompt sent for **{prize}{qty_text}**.", ephemeral=True
+    )
+
+
+@tree.command(name="multisend", description="Send multiple prize prompts into this support ticket", guild=discord.Object(id=GUILD_ID))
+@app_commands.describe(
+    prop_firm_1="First prize prop firm (or 'Unknown Prize')",
+    account_type_1="First prize account type (skip if Unknown Prize)",
+    account_size_1="First prize account size (skip if Unknown Prize)",
+    prop_firm_2="Second prize prop firm (or 'Unknown Prize')",
+    account_type_2="Second prize account type (skip if Unknown Prize)",
+    account_size_2="Second prize account size (skip if Unknown Prize)",
+    prop_firm_3="Third prize prop firm (optional)",
+    account_type_3="Third prize account type (optional)",
+    account_size_3="Third prize account size (optional)",
+    code="Optional giveaway code",
+    show="Show the prize was won on"
+)
+@app_commands.autocomplete(
+    prop_firm_1=prop_firm_autocomplete,
+    account_type_1=account_type_autocomplete_1,
+    account_size_1=account_size_autocomplete_1,
+    prop_firm_2=prop_firm_autocomplete,
+    account_type_2=account_type_autocomplete_2,
+    account_size_2=account_size_autocomplete_2,
+    prop_firm_3=prop_firm_autocomplete,
+    account_type_3=account_type_autocomplete_3,
+    account_size_3=account_size_autocomplete_3,
+    show=show_autocomplete
+)
+async def multisend_prompt(
+    interaction: discord.Interaction,
+    prop_firm_1: str,
+    prop_firm_2: str,
+    account_type_1: str = "",
+    account_size_1: str = "",
+    account_type_2: str = "",
+    account_size_2: str = "",
+    prop_firm_3: str | None = None,
+    account_type_3: str = "",
+    account_size_3: str = "",
+    code: str | None = None,
+    show: str | None = None
+):
+    if not await ensure_mod(interaction):
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel) or not is_support_ticket_channel(channel):
+        await interaction.response.send_message(
+            "❌ `/multisend` can only be used inside a support ticket channel.", ephemeral=True
+        )
+        return
+
+    raw_inputs = [
+        (prop_firm_1, account_type_1, account_size_1),
+        (prop_firm_2, account_type_2, account_size_2),
+    ]
+    if prop_firm_3:
+        raw_inputs.append((prop_firm_3, account_type_3, account_size_3))
+
+    resolved_prizes = []
+    for pf, at, sz in raw_inputs:
+        r, error = resolve_prize(pf, at, sz)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        resolved_prizes.append(r)
+
+    selected_prizes = dedupe_preserve_order([r["display_name"] for r in resolved_prizes])
+    if len(selected_prizes) < 2:
+        await interaction.response.send_message(
+            "❌ Select at least two different prizes, or use `/send` for a single prize.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Build the same combined header that /multi generates
+    header_lines = ["**Prizes Won:**"] + [f"- {p}" for p in selected_prizes]
+    if show:
+        header_lines.append(f"**Show:** {show}")
+    if code:
+        header_lines.append(f"**Code:** `{code}`")
+    await channel.send("\n".join(header_lines))
+
+    # Send a labeled prompt block for each prize, separated by a divider
+    prompt_blocks = [f"## {p}\n{get_prompt_for_prize(p, show=show)}" for p in selected_prizes]
+    prompt_body = "\n\n---\n\n".join(prompt_blocks)
+    await send_long_message(channel, prompt_body)
+
+    summary = " & ".join(selected_prizes)
+    await interaction.followup.send(
+        f"✅ Prompts sent for **{summary}**.", ephemeral=True
+    )
 
 
 @tree.command(name="yt", description="Log a YouTube winner without creating a ticket", guild=discord.Object(id=GUILD_ID))
