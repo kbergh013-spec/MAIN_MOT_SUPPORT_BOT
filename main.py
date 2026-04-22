@@ -2955,7 +2955,7 @@ async def winner(
     await interaction.followup.send(msg, ephemeral=True)
 
 
-@tree.command(name="multi", description="Log a Discord winner with multiple prizes and create one ticket", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="winmulti", description="Log a Discord winner with multiple prizes and create one ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     user="Winner",
     prop_firm_1="First prize prop firm (or 'Unknown Prize')",
