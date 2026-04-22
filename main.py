@@ -3128,7 +3128,7 @@ async def send_prompt(
     )
 
 
-@tree.command(name="multisend", description="Send multiple prize prompts into this support ticket", guild=discord.Object(id=GUILD_ID))
+@tree.command(name="sendmulti", description="Send multiple prize prompts into this support ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     prop_firm_1="First prize prop firm (or 'Unknown Prize')",
     account_type_1="First prize account type (skip if Unknown Prize)",
