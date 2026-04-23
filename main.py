@@ -1972,21 +1972,11 @@ async def _inactivity_loop():
                     if hours_inactive >= INACTIVITY_WARN_HOURS:
                         user_mention = f"<@{user_id_str}>" if user_id_str else "Hello"
                         try:
-                            # Public message — visible to everyone in the ticket
+                            # Plain text warning — no buttons, no pings
                             await channel.send(
                                 f"{user_mention} This ticket has been inactive for "
-                                f"{INACTIVITY_WARN_HOURS} hours and will automatically close in "
-                                f"{INACTIVITY_CLOSE_AFTER_WARN_HOURS} hours unless you respond. "
-                                "A moderator can also keep it open if needed."
-                            )
-                            # Buttons sent separately with a mod role mention so only
-                            # mods see the controls in context — user sees no buttons
-                            guild = channel.guild
-                            mod_role = guild.get_role(MOD_ROLE_ID) if guild else None
-                            mod_mention = mod_role.mention if mod_role else "Mods"
-                            await channel.send(
-                                f"{mod_mention} — inactivity controls:",
-                                view=InactivityControlView(),
+                                f"{INACTIVITY_WARN_HOURS} hours and will automatically be deleted in "
+                                f"{INACTIVITY_CLOSE_AFTER_WARN_HOURS} hours unless you respond."
                             )
                             await asyncio.to_thread(
                                 update_ticket_inactivity_fields,
