@@ -1645,6 +1645,55 @@ def set_ticket_last_activity(ticket_channel_id: str, when: datetime | None = Non
     )
 
 
+def _insert_support_ticket_row(
+    user_id: str,
+    user_name: str,
+    server_name: str,
+    ticket_channel_id: str,
+    ticket_channel_name: str,
+    ticket_number: int,
+    timestamp: str,
+    now_utc: datetime,
+):
+    """
+    Insert a minimal winners row for a panel-opened support ticket so the
+    inactivity loop can find and track it.  All prize/mod fields are None —
+    this row exists purely for inactivity tracking purposes.
+    Idempotent: if a row already exists for this channel it is left untouched.
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                # Only insert if no row exists for this channel yet
+                cur.execute(
+                    "SELECT 1 FROM winners WHERE ticket_channel_id = %s LIMIT 1",
+                    (ticket_channel_id,)
+                )
+                if cur.fetchone() is not None:
+                    return  # Already tracked — nothing to do
+                cur.execute("""
+                    INSERT INTO winners (
+                        timestamp, user_id, user_name, server, source, status, type,
+                        ticket_channel_id, ticket_channel_name, ticket_number,
+                        last_activity_at
+                    ) VALUES (%s, %s, %s, %s, 'panel', 'ticket_created', 'support',
+                              %s, %s, %s, %s)
+                """, (
+                    timestamp,
+                    user_id,
+                    user_name,
+                    server_name,
+                    ticket_channel_id,
+                    ticket_channel_name,
+                    ticket_number,
+                    now_utc,
+                ))
+            conn.commit()
+        print(f"[SUPPORT] Inserted inactivity tracking row for #{ticket_channel_name}")
+    except Exception as e:
+        print(f"[SUPPORT ERROR] _insert_support_ticket_row: {e}")
+
+
 # =========================
 # INACTIVITY CONTROL VIEW  (persistent — registered in setup_hook)
 # =========================
@@ -2829,13 +2878,21 @@ class OpenSupportTicketView(discord.ui.View):
                 view=FaqCategoryView()
             )
 
-            # ── NEW: seed last_activity_at immediately so the inactivity timer
-            # starts from ticket creation, not from some undefined NULL state.
+            # Insert a minimal winners row so the inactivity loop can track
+            # this ticket. Panel-opened support tickets have no winners row by
+            # default — without this they are invisible to the inactivity system.
             now_utc = datetime.utcnow()
+            timestamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
             await asyncio.to_thread(
-                update_ticket_inactivity_fields,
+                _insert_support_ticket_row,
+                str(user.id),
+                user.name,
+                guild.name,
                 str(ticket_channel.id),
-                last_activity_at=now_utc,
+                ticket_channel.name,
+                ticket_number,
+                timestamp,
+                now_utc,
             )
 
             await interaction.followup.send(
