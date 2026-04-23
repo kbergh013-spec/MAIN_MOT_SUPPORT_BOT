@@ -4,7 +4,7 @@ import uuid
 import asyncio
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -62,6 +62,16 @@ SHOW_OPTIONS = [
     "Traders and Haters Podcast",
     "Trading Wheels"
 ]
+
+# =========================
+# INACTIVITY SYSTEM CONSTANTS
+# =========================
+# After this many hours of inactivity, send the warning message.
+INACTIVITY_WARN_HOURS = 24
+# After sending the warning, auto-close after this many hours unless suppressed.
+INACTIVITY_CLOSE_AFTER_WARN_HOURS = 4
+# How often the background checker runs (seconds).
+INACTIVITY_CHECK_INTERVAL_SECONDS = 300  # 5 minutes
 
 # =========================
 # SHOW TAG LINE HELPER
@@ -192,13 +202,25 @@ def init_db():
             # -------------------------
             # NEW: Ticket number sequence and column
             # -------------------------
-            # Sequence starts at 13001 — safe to run every startup (IF NOT EXISTS)
             cur.execute("""
                 CREATE SEQUENCE IF NOT EXISTS ticket_number_seq START 13001
             """)
-            # Add ticket_number column to winners if it doesn't exist yet
             cur.execute("""
                 ALTER TABLE winners ADD COLUMN IF NOT EXISTS ticket_number INTEGER
+            """)
+
+            # -------------------------
+            # NEW: Inactivity tracking columns
+            # These are safe to add at any time — all default to NULL so existing
+            # rows are unaffected and the checker treats NULL as "not yet active".
+            # -------------------------
+            cur.execute("""
+                ALTER TABLE winners
+                    ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS inactivity_warning_sent_at TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS auto_close_disabled BOOLEAN NOT NULL DEFAULT false,
+                    ADD COLUMN IF NOT EXISTS auto_close_disabled_by TEXT,
+                    ADD COLUMN IF NOT EXISTS auto_close_disabled_at TIMESTAMPTZ
             """)
 
             # -------------------------
@@ -812,6 +834,33 @@ def make_unknown_resolved() -> dict:
 
 
 # =========================
+# MOT INDICATOR HELPER
+# =========================
+MOT_INDICATOR_LABEL = "MOT Indicator"
+# The two valid durations mods can pick — shown as the "account_type" step.
+MOT_INDICATOR_DURATIONS = ["Weekly", "Monthly"]
+
+def is_mot_indicator(prop_firm: str) -> bool:
+    return prop_firm.strip() == MOT_INDICATOR_LABEL
+
+def make_mot_indicator_resolved(duration: str) -> dict:
+    """
+    Build a resolved-prize dict for an MOT Indicator selection.
+    display_name mirrors what get_prompt_for_prize() already expects
+    (it checks p.startswith("MOT Indicator")).
+    All catalog IDs are None — MOT Indicators are not in the prop-firm catalog.
+    """
+    display_name = f"MOT Indicator {duration}"
+    return {
+        "display_name": display_name,
+        "prize_catalog_id": None,
+        "prop_firm_id": None,
+        "account_type_id": None,
+        "account_size_id": None,
+    }
+
+
+# =========================
 # PROMPT HELPERS
 # =========================
 def load_prompt_config():
@@ -907,7 +956,7 @@ def _row_to_entry(row: dict) -> dict:
         "prop_firm_id": row.get("prop_firm_id"),
         "account_type_id": row.get("account_type_id"),
         "account_size_id": row.get("account_size_id"),
-        "ticket_number": row.get("ticket_number"),  # NEW
+        "ticket_number": row.get("ticket_number"),
     }
 
 
@@ -1018,7 +1067,7 @@ def save_data(data: dict):
                             entry.get("prop_firm_id"),
                             entry.get("account_type_id"),
                             entry.get("account_size_id"),
-                            entry.get("ticket_number"),  # NEW
+                            entry.get("ticket_number"),
                         ))
             conn.commit()
     except Exception as e:
@@ -1139,9 +1188,6 @@ def fetch_transcript_messages(transcript_id: int) -> dict:
 # UTILS
 # =========================
 
-# NEW: Draw the next ticket number from the Postgres sequence.
-# Postgres sequences are atomic — concurrent calls always get unique values,
-# even if two tickets are created at exactly the same moment.
 def next_ticket_number() -> int:
     with get_db() as conn:
         with conn.cursor() as cur:
@@ -1149,9 +1195,6 @@ def next_ticket_number() -> int:
             return cur.fetchone()[0]
 
 
-# NEW: Sanitize a Discord username for use in a channel name.
-# Result is lowercase, spaces become hyphens, only a-z/0-9/-/_ kept,
-# trimmed to max_len, and leading/trailing hyphens stripped.
 def sanitize_username_for_channel(user_name: str, max_len: int = 20) -> str:
     name = user_name.lower().replace(" ", "-")
     allowed = "abcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -1160,7 +1203,6 @@ def sanitize_username_for_channel(user_name: str, max_len: int = 20) -> str:
     return name[:max_len] or "user"
 
 
-# Kept unchanged — used by giveaway/winner channels only
 def safe_channel_name(prefix: str, user_name: str, label: str = "") -> str:
     parts = [prefix, user_name]
     if label:
@@ -1172,20 +1214,15 @@ def safe_channel_name(prefix: str, user_name: str, label: str = "") -> str:
     return cleaned[:90]
 
 
-# NEW: Updated to also recognise the new sequential format (e.g. 13001-username
-# and closed-13001-username) without breaking old support-/manual-/prize- prefixes.
 def is_support_ticket_channel(channel: discord.abc.GuildChannel) -> bool:
     if not isinstance(channel, discord.TextChannel):
         return False
     if channel.category_id != SUPPORT_CATEGORY_ID:
         return False
     name = channel.name
-    # Strip closed- prefix before checking format
     check_name = name[len("closed-"):] if name.startswith("closed-") else name
-    # New sequential format: starts with a digit (e.g. 13001-username)
     if check_name and check_name[0].isdigit():
         return True
-    # Legacy formats
     return (
         name.startswith("support-") or
         name.startswith("closed-support-") or
@@ -1510,6 +1547,339 @@ async def mark_channel_entries_completed(channel: discord.TextChannel):
 
 
 # =========================
+# INACTIVITY DB HELPERS
+# =========================
+
+def get_open_tickets_for_inactivity_check() -> list[dict]:
+    """
+    Return one representative row per open ticket that is eligible for
+    inactivity processing.  We deduplicate by ticket_channel_id because a
+    single ticket may have multiple rows in winners (multi-prize bundles).
+
+    Returned columns:
+        ticket_channel_id, user_id, last_activity_at,
+        inactivity_warning_sent_at, auto_close_disabled
+    """
+    try:
+        with get_db() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT DISTINCT ON (ticket_channel_id)
+                        ticket_channel_id,
+                        user_id,
+                        last_activity_at,
+                        inactivity_warning_sent_at,
+                        auto_close_disabled
+                    FROM winners
+                    WHERE status NOT IN ('completed', 'tracked_no_ticket', 'waiting_for_support_ticket')
+                      AND ticket_channel_id IS NOT NULL
+                    ORDER BY ticket_channel_id, id ASC
+                """)
+                return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[INACTIVITY ERROR] get_open_tickets_for_inactivity_check: {e}")
+        return []
+
+
+def update_ticket_inactivity_fields(
+    ticket_channel_id: str,
+    *,
+    last_activity_at: datetime | None = None,
+    inactivity_warning_sent_at: datetime | None = None,
+    clear_warning: bool = False,
+    auto_close_disabled: bool | None = None,
+    auto_close_disabled_by: str | None = None,
+    auto_close_disabled_at: datetime | None = None,
+):
+    """
+    Surgically update only the inactivity columns for every winners row that
+    belongs to this channel.  Pass clear_warning=True to NULL-out
+    inactivity_warning_sent_at (used when the opener replies and we restart
+    the cycle).
+    """
+    try:
+        set_clauses = []
+        params: list = []
+
+        if last_activity_at is not None:
+            set_clauses.append("last_activity_at = %s")
+            params.append(last_activity_at)
+
+        if clear_warning:
+            set_clauses.append("inactivity_warning_sent_at = NULL")
+        elif inactivity_warning_sent_at is not None:
+            set_clauses.append("inactivity_warning_sent_at = %s")
+            params.append(inactivity_warning_sent_at)
+
+        if auto_close_disabled is not None:
+            set_clauses.append("auto_close_disabled = %s")
+            params.append(auto_close_disabled)
+
+        if auto_close_disabled_by is not None:
+            set_clauses.append("auto_close_disabled_by = %s")
+            params.append(auto_close_disabled_by)
+
+        if auto_close_disabled_at is not None:
+            set_clauses.append("auto_close_disabled_at = %s")
+            params.append(auto_close_disabled_at)
+
+        if not set_clauses:
+            return
+
+        params.append(ticket_channel_id)
+        sql = f"UPDATE winners SET {', '.join(set_clauses)} WHERE ticket_channel_id = %s"
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+            conn.commit()
+    except Exception as e:
+        print(f"[INACTIVITY ERROR] update_ticket_inactivity_fields: {e}")
+
+
+def set_ticket_last_activity(ticket_channel_id: str, when: datetime | None = None):
+    """Convenience wrapper: stamp last_activity_at and clear any warning."""
+    update_ticket_inactivity_fields(
+        ticket_channel_id,
+        last_activity_at=when or datetime.utcnow(),
+        clear_warning=True,
+    )
+
+
+# =========================
+# INACTIVITY CONTROL VIEW  (persistent — registered in setup_hook)
+# =========================
+
+class InactivityControlView(discord.ui.View):
+    """
+    Mod-only buttons that appear in the inactivity warning message.
+    Persists across bot restarts because it is registered with add_view().
+    custom_ids must be globally unique and stable.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Keep Open (Disable Auto-Close)",
+        style=discord.ButtonStyle.success,
+        emoji="🔓",
+        custom_id="inactivity_disable_auto_close",
+    )
+    async def disable_auto_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not user_is_mod(interaction.user):
+            await interaction.response.send_message(
+                "❌ Only moderators can disable auto-close.", ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
+            return
+
+        await asyncio.to_thread(
+            update_ticket_inactivity_fields,
+            str(channel.id),
+            auto_close_disabled=True,
+            auto_close_disabled_by=interaction.user.name,
+            auto_close_disabled_at=datetime.utcnow(),
+        )
+
+        await interaction.response.send_message(
+            f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
+            "The ticket will remain open until manually closed or deleted.",
+            ephemeral=False,
+        )
+
+    @discord.ui.button(
+        label="Re-enable Auto-Close",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏱️",
+        custom_id="inactivity_enable_auto_close",
+    )
+    async def enable_auto_close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not isinstance(interaction.user, discord.Member) or not user_is_mod(interaction.user):
+            await interaction.response.send_message(
+                "❌ Only moderators can re-enable auto-close.", ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
+            return
+
+        # Re-enable auto-close and restart the inactivity timer from now.
+        now = datetime.utcnow()
+        await asyncio.to_thread(
+            update_ticket_inactivity_fields,
+            str(channel.id),
+            auto_close_disabled=False,
+            auto_close_disabled_by=None,
+            auto_close_disabled_at=None,
+            last_activity_at=now,
+            clear_warning=True,
+        )
+
+        await interaction.response.send_message(
+            f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
+            f"The inactivity timer has been reset — the ticket will warn again after "
+            f"{INACTIVITY_WARN_HOURS} hours of inactivity.",
+            ephemeral=False,
+        )
+
+
+# =========================
+# CLOSE TICKET HELPER (reused by inactivity loop)
+# =========================
+
+async def _close_ticket_channel(channel: discord.TextChannel, reason: str):
+    """
+    Mirrors the logic in SupportTicketControls.close_button / GiveawayTicketControls.close_ticket
+    exactly — renames to closed-{name} and revokes send_messages for non-mod members.
+    Does NOT delete; a separate delete must be triggered by a mod.
+    """
+    if channel.name.startswith("closed-"):
+        return  # Already closed — idempotent
+
+    try:
+        new_overwrites = {}
+        for target, overwrite in channel.overwrites.items():
+            if isinstance(target, discord.Member) and not user_is_mod(target):
+                overwrite = discord.PermissionOverwrite.from_pair(
+                    overwrite.pair()[0], overwrite.pair()[1]
+                )
+                overwrite.send_messages = False
+            new_overwrites[target] = overwrite
+
+        new_name = f"closed-{channel.name}"
+        await channel.edit(name=new_name, overwrites=new_overwrites, reason=reason)
+        await channel.send(
+            "🔒 This ticket has been automatically closed due to inactivity. "
+            "A moderator can reopen it using the **Reopen Ticket** button above if needed."
+        )
+    except Exception as e:
+        print(f"[INACTIVITY] Failed to auto-close #{channel.name}: {e}")
+
+
+# =========================
+# INACTIVITY BACKGROUND LOOP
+# =========================
+
+async def _inactivity_loop():
+    """
+    Runs every INACTIVITY_CHECK_INTERVAL_SECONDS.
+    Uses the DB as source of truth — never scans Discord channels blindly.
+
+    Logic per ticket:
+      1. If last_activity_at is NULL → treat ticket creation timestamp as
+         last activity (backfill so old tickets aren't immediately warned).
+      2. If inactive for >= INACTIVITY_WARN_HOURS and no warning sent yet
+         → send warning message + stamp inactivity_warning_sent_at.
+      3. If warning already sent AND grace period (INACTIVITY_CLOSE_AFTER_WARN_HOURS)
+         has elapsed AND auto_close_disabled is false
+         → auto-close the channel.
+    """
+    await bot.wait_until_ready()
+    print("[INACTIVITY] Loop started.")
+
+    while not bot.is_closed():
+        try:
+            rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
+            now_utc = datetime.utcnow()
+
+            for row in rows:
+                channel_id_str = row.get("ticket_channel_id")
+                if not channel_id_str:
+                    continue
+
+                # Resolve Discord channel — skip if not found (already deleted)
+                try:
+                    channel_id_int = int(channel_id_str)
+                except ValueError:
+                    continue
+
+                channel = bot.get_channel(channel_id_int)
+                if not isinstance(channel, discord.TextChannel):
+                    continue  # Channel gone — nothing to do
+
+                # Skip closed channels (someone manually closed it already)
+                if channel.name.startswith("closed-"):
+                    continue
+
+                user_id_str = row.get("user_id")
+
+                # ── Determine last activity time ──────────────────────────────
+                last_activity = row.get("last_activity_at")
+                if last_activity is None:
+                    # No activity recorded yet.  Backfill using the channel's
+                    # creation time so old tickets don't get warned on first boot.
+                    # channel.created_at is UTC-aware; we need a naive UTC datetime
+                    # to compare with datetime.utcnow().
+                    created_naive = channel.created_at.replace(tzinfo=None)
+                    await asyncio.to_thread(
+                        update_ticket_inactivity_fields,
+                        channel_id_str,
+                        last_activity_at=created_naive,
+                    )
+                    last_activity = created_naive
+
+                # Normalize: strip tzinfo if tz-aware (DB may return aware datetimes)
+                if hasattr(last_activity, "tzinfo") and last_activity.tzinfo is not None:
+                    last_activity = last_activity.replace(tzinfo=None)
+
+                hours_inactive = (now_utc - last_activity).total_seconds() / 3600
+
+                warning_sent_at = row.get("inactivity_warning_sent_at")
+                if warning_sent_at is not None and hasattr(warning_sent_at, "tzinfo") and warning_sent_at.tzinfo is not None:
+                    warning_sent_at = warning_sent_at.replace(tzinfo=None)
+
+                auto_close_disabled = bool(row.get("auto_close_disabled", False))
+
+                # ── Branch 1: Warning not yet sent ───────────────────────────
+                if warning_sent_at is None:
+                    if hours_inactive >= INACTIVITY_WARN_HOURS:
+                        user_mention = f"<@{user_id_str}>" if user_id_str else "Hello"
+                        try:
+                            await channel.send(
+                                f"{user_mention} This ticket has been inactive for "
+                                f"{INACTIVITY_WARN_HOURS} hours and will automatically close in "
+                                f"{INACTIVITY_CLOSE_AFTER_WARN_HOURS} hours unless you respond. "
+                                "A moderator can also keep it open if needed.",
+                                view=InactivityControlView(),
+                            )
+                            await asyncio.to_thread(
+                                update_ticket_inactivity_fields,
+                                channel_id_str,
+                                inactivity_warning_sent_at=now_utc,
+                            )
+                            print(f"[INACTIVITY] Warned #{channel.name} (inactive {hours_inactive:.1f}h)")
+                        except Exception as e:
+                            print(f"[INACTIVITY] Could not send warning to #{channel.name}: {e}")
+
+                # ── Branch 2: Warning sent, grace period may have elapsed ────
+                else:
+                    if auto_close_disabled:
+                        continue  # Mod explicitly kept it open — respect that
+
+                    hours_since_warning = (now_utc - warning_sent_at).total_seconds() / 3600
+                    if hours_since_warning >= INACTIVITY_CLOSE_AFTER_WARN_HOURS:
+                        print(f"[INACTIVITY] Auto-closing #{channel.name} "
+                              f"(warned {hours_since_warning:.1f}h ago)")
+                        await _close_ticket_channel(
+                            channel,
+                            reason="Auto-closed due to inactivity"
+                        )
+                        # Mark completed in DB so this ticket is never processed again
+                        await mark_channel_entries_completed(channel)
+
+        except Exception as e:
+            print(f"[INACTIVITY ERROR] Loop iteration failed: {e}")
+
+        await asyncio.sleep(INACTIVITY_CHECK_INTERVAL_SECONDS)
+
+
+# =========================
 # UPDATE PRIZE — CHAINED DROPDOWN
 # =========================
 async def apply_prize_update_to_db(
@@ -1583,7 +1953,11 @@ class UpdatePrizeFirmSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         firm = self.values[0]
-        types = get_account_types_for_firm(firm)
+        # MOT Indicator uses hardcoded durations, not DB account types
+        if is_mot_indicator(firm):
+            types = [{"name": d} for d in MOT_INDICATOR_DURATIONS]
+        else:
+            types = get_account_types_for_firm(firm)
         if not types:
             await interaction.response.send_message("❌ No account types found for that firm.", ephemeral=True)
             return
@@ -1612,6 +1986,25 @@ class UpdatePrizeTypeSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         account_type = self.values[0]
+        # MOT Indicator has no account size — skip straight to confirm
+        if is_mot_indicator(self.firm):
+            resolved = make_mot_indicator_resolved(account_type)
+            new_prize = resolved["display_name"]
+            view = UpdatePrizeConfirmView(
+                old_prize=self.old_prize,
+                new_prize=new_prize,
+                resolved=resolved
+            )
+            await interaction.response.edit_message(
+                content=(
+                    f"**Update Prize — Confirm**\n\n"
+                    f"**From:** {self.old_prize}\n"
+                    f"**To:** {new_prize}\n\n"
+                    "Click **Confirm** to apply this change."
+                ),
+                view=view
+            )
+            return
         sizes = get_sizes_for_firm_and_type(self.firm, account_type)
         if not sizes:
             await interaction.response.send_message("❌ No sizes found for that firm and account type.", ephemeral=True)
@@ -2360,9 +2753,6 @@ class OpenSupportTicketView(discord.ui.View):
             await interaction.response.send_message("Already opening a ticket for you, please wait.", ephemeral=True)
             return
 
-        # Defer immediately — this acknowledges the interaction within Discord's 3-second
-        # window and gives us up to 15 minutes to follow up. All subsequent replies use
-        # interaction.followup instead of interaction.response.
         await interaction.response.defer(ephemeral=True)
         ticket_creation_in_progress.add(user.id)
         try:
@@ -2385,8 +2775,6 @@ class OpenSupportTicketView(discord.ui.View):
                 await interaction.followup.send("Mod role not found. Check MOD_ROLE_ID.", ephemeral=True)
                 return
 
-            # Draw a concurrency-safe sequential ticket number from Postgres sequence,
-            # then build the channel name as <ticket_number>-<sanitized_username>.
             ticket_number = next_ticket_number()
             sanitized = sanitize_username_for_channel(user.name)
             channel_name = f"{ticket_number}-{sanitized}"
@@ -2416,7 +2804,6 @@ class OpenSupportTicketView(discord.ui.View):
             except Exception as e:
                 print(f"Failed to pin support control message: {e}")
 
-            # First message shows Ticket # and username prominently at the top.
             await ticket_channel.send(
                 f"**Ticket #{ticket_number}**\n"
                 f"**User:** {user.name}\n\n"
@@ -2432,6 +2819,16 @@ class OpenSupportTicketView(discord.ui.View):
                 "If you won a prize outside of Discord, click **Claim My Prize**.",
                 view=FaqCategoryView()
             )
+
+            # ── NEW: seed last_activity_at immediately so the inactivity timer
+            # starts from ticket creation, not from some undefined NULL state.
+            now_utc = datetime.utcnow()
+            await asyncio.to_thread(
+                update_ticket_inactivity_fields,
+                str(ticket_channel.id),
+                last_activity_at=now_utc,
+            )
+
             await interaction.followup.send(
                 f"Your support ticket has been created: {ticket_channel.mention}",
                 ephemeral=True
@@ -2491,7 +2888,6 @@ async def create_manual_ticket(
         raise ValueError("Mod role not found. Check MOD_ROLE_ID.")
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # NEW: Sequential ticket number + sanitized username for channel name
     ticket_number = next_ticket_number()
     sanitized = sanitize_username_for_channel(user.name)
     channel_name = f"{ticket_number}-{sanitized}"
@@ -2513,7 +2909,6 @@ async def create_manual_ticket(
         reason=f"Manual ticket for {user} - {reason}"
     )
 
-    # NEW: Opening message includes Ticket # and username
     opening_message = (
         f"**Ticket #{ticket_number}**\n"
         f"**User:** {user.name}\n\n"
@@ -2555,10 +2950,19 @@ async def create_manual_ticket(
         "prop_firm_id": None,
         "account_type_id": None,
         "account_size_id": None,
-        "ticket_number": ticket_number,  # NEW
+        "ticket_number": ticket_number,
     }
     data["winners"].append(entry)
     save_data(data)
+
+    # ── NEW: seed last_activity_at so inactivity timer starts from creation
+    now_utc = datetime.utcnow()
+    await asyncio.to_thread(
+        update_ticket_inactivity_fields,
+        str(ticket_channel.id),
+        last_activity_at=now_utc,
+    )
+
     return ticket_channel
 
 
@@ -2605,7 +3009,6 @@ async def create_giveaway_ticket_and_log(
         overwrites[guild.me] = discord.PermissionOverwrite(
             view_channel=True, send_messages=True, read_message_history=True, manage_channels=True
         )
-    # Giveaway channels keep the existing winner-{bundle_id}-{username} format unchanged
     ticket_name = safe_channel_name("winner", bundle_id, user.name)
     ticket_channel = await guild.create_text_channel(
         name=ticket_name,
@@ -2686,10 +3089,19 @@ async def create_giveaway_ticket_and_log(
             "prop_firm_id": prop_firm_ids[i] if prop_firm_ids and i < len(prop_firm_ids) else None,
             "account_type_id": account_type_ids[i] if account_type_ids and i < len(account_type_ids) else None,
             "account_size_id": account_size_ids[i] if account_size_ids and i < len(account_size_ids) else None,
-            "ticket_number": None,  # Giveaway tickets don't use the sequential counter
+            "ticket_number": None,
         }
         data["winners"].append(entry)
     save_data(data)
+
+    # ── NEW: seed last_activity_at so inactivity timer starts from creation
+    now_utc = datetime.utcnow()
+    await asyncio.to_thread(
+        update_ticket_inactivity_fields,
+        str(ticket_channel.id),
+        last_activity_at=now_utc,
+    )
+
     return ticket_channel, bundle_id
 
 
@@ -2703,8 +3115,12 @@ class GiveawayBot(commands.Bot):
         self.add_view(SupportTicketControls())
         self.add_view(OpenSupportTicketView())
         self.add_view(FaqCategoryView())
+        # NEW: register InactivityControlView so its buttons survive restarts
+        self.add_view(InactivityControlView())
         self.loop.create_task(self._safe_ensure_support_panel())
         self.loop.create_task(self._cleanup_loop())
+        # NEW: start inactivity background task
+        self.loop.create_task(_inactivity_loop())
 
     async def _safe_ensure_support_panel(self):
         try:
@@ -2753,12 +3169,80 @@ tree = bot.tree
 
 
 # =========================
+# ON MESSAGE — inactivity reset
+# =========================
+
+@bot.event
+async def on_message(message: discord.Message):
+    """
+    Reset the inactivity timer whenever the ticket opener sends a message
+    in their own ticket channel.
+
+    Rules:
+    - Ignore bot messages (prevents the warning message itself from resetting the timer)
+    - Only act inside ticket channels that are tracked in the DB
+    - Only reset when the author is the ticket opener (user_id stored in channel topic
+      for support tickets, or in winners table for giveaway/manual tickets)
+    - Always call process_commands so prefix commands still work
+    """
+    # Let commands run regardless
+    await bot.process_commands(message)
+
+    # Ignore bot messages
+    if message.author.bot:
+        return
+
+    channel = message.channel
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    # Only act inside ticket channels
+    is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
+    if not is_ticket:
+        return
+
+    # Skip closed tickets — no point updating an already-closed channel
+    if channel.name.startswith("closed-"):
+        return
+
+    # Resolve the ticket opener's user ID
+    opener_id: str | None = None
+
+    # Support / manual tickets store user_id in the channel topic
+    if channel.topic and channel.topic.startswith("user_id:"):
+        raw = channel.topic.split("user_id:")[1].strip()
+        if raw.isdigit():
+            opener_id = raw
+
+    # Giveaway tickets store user_id in the winners table
+    if opener_id is None:
+        entries = find_entries_for_channel(channel)
+        if entries:
+            opener_id = entries[0].get("user_id")
+
+    if opener_id is None:
+        return  # Can't determine opener — skip
+
+    # Only reset when the message author is the opener
+    if str(message.author.id) != str(opener_id):
+        return
+
+    # Stamp last_activity_at and clear any pending warning
+    await asyncio.to_thread(
+        set_ticket_last_activity,
+        str(channel.id),
+    )
+
+
+# =========================
 # AUTOCOMPLETE
 # =========================
 async def prop_firm_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     choices = []
     if current.lower() in "unknown prize":
         choices.append(app_commands.Choice(name="Unknown Prize", value="Unknown Prize"))
+    if current.lower() in "mot indicator":
+        choices.append(app_commands.Choice(name="MOT Indicator", value="MOT Indicator"))
     firms = get_active_prop_firms()
     choices += [
         app_commands.Choice(name=f["name"], value=f["name"])
@@ -2780,6 +3264,12 @@ async def account_type_autocomplete(interaction: discord.Interaction, current: s
     prop_firm = interaction.namespace.prop_firm or ""
     if not prop_firm or is_unknown_prize(prop_firm):
         return []
+    if is_mot_indicator(prop_firm):
+        return [
+            app_commands.Choice(name=d, value=d)
+            for d in MOT_INDICATOR_DURATIONS
+            if current.lower() in d.lower()
+        ]
     types = get_account_types_for_firm(prop_firm)
     return [
         app_commands.Choice(name=t["name"], value=t["name"])
@@ -2791,7 +3281,7 @@ async def account_type_autocomplete(interaction: discord.Interaction, current: s
 async def account_size_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm or ""
     account_type = interaction.namespace.account_type or ""
-    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm) or is_mot_indicator(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [
@@ -2805,6 +3295,8 @@ async def account_type_autocomplete_1(interaction: discord.Interaction, current:
     prop_firm = interaction.namespace.prop_firm_1 or ""
     if not prop_firm or is_unknown_prize(prop_firm):
         return []
+    if is_mot_indicator(prop_firm):
+        return [app_commands.Choice(name=d, value=d) for d in MOT_INDICATOR_DURATIONS if current.lower() in d.lower()]
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
 
@@ -2812,7 +3304,7 @@ async def account_type_autocomplete_1(interaction: discord.Interaction, current:
 async def account_size_autocomplete_1(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_1 or ""
     account_type = interaction.namespace.account_type_1 or ""
-    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm) or is_mot_indicator(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
@@ -2822,6 +3314,8 @@ async def account_type_autocomplete_2(interaction: discord.Interaction, current:
     prop_firm = interaction.namespace.prop_firm_2 or ""
     if not prop_firm or is_unknown_prize(prop_firm):
         return []
+    if is_mot_indicator(prop_firm):
+        return [app_commands.Choice(name=d, value=d) for d in MOT_INDICATOR_DURATIONS if current.lower() in d.lower()]
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
 
@@ -2829,7 +3323,7 @@ async def account_type_autocomplete_2(interaction: discord.Interaction, current:
 async def account_size_autocomplete_2(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_2 or ""
     account_type = interaction.namespace.account_type_2 or ""
-    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm) or is_mot_indicator(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
@@ -2839,6 +3333,8 @@ async def account_type_autocomplete_3(interaction: discord.Interaction, current:
     prop_firm = interaction.namespace.prop_firm_3 or ""
     if not prop_firm or is_unknown_prize(prop_firm):
         return []
+    if is_mot_indicator(prop_firm):
+        return [app_commands.Choice(name=d, value=d) for d in MOT_INDICATOR_DURATIONS if current.lower() in d.lower()]
     types = get_account_types_for_firm(prop_firm)
     return [app_commands.Choice(name=t["name"], value=t["name"]) for t in types if current.lower() in t["name"].lower()][:25]
 
@@ -2846,7 +3342,7 @@ async def account_type_autocomplete_3(interaction: discord.Interaction, current:
 async def account_size_autocomplete_3(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
     prop_firm = interaction.namespace.prop_firm_3 or ""
     account_type = interaction.namespace.account_type_3 or ""
-    if not prop_firm or not account_type or is_unknown_prize(prop_firm):
+    if not prop_firm or not account_type or is_unknown_prize(prop_firm) or is_mot_indicator(prop_firm):
         return []
     sizes = get_sizes_for_firm_and_type(prop_firm, account_type)
     return [app_commands.Choice(name=s["label"], value=s["label"]) for s in sizes if current.lower() in s["label"].lower()][:25]
@@ -2858,6 +3354,13 @@ async def account_size_autocomplete_3(interaction: discord.Interaction, current:
 def resolve_prize(prop_firm: str, account_type: str, account_size: str) -> tuple[dict | None, str | None]:
     if is_unknown_prize(prop_firm):
         return make_unknown_resolved(), None
+    if is_mot_indicator(prop_firm):
+        if account_type not in MOT_INDICATOR_DURATIONS:
+            return None, (
+                f"❌ For **MOT Indicator**, account type must be one of: "
+                f"{', '.join(MOT_INDICATOR_DURATIONS)}. Please select from the autocomplete options."
+            )
+        return make_mot_indicator_resolved(account_type), None
     resolved = resolve_prize_from_catalog(prop_firm, account_type, account_size)
     if not resolved:
         return None, (
@@ -3060,12 +3563,6 @@ async def multiwinner(
     await interaction.followup.send(msg, ephemeral=True)
 
 
-# =========================
-# /send AND /multisend
-# Send a prize prompt into an existing support ticket — no DB logging, no new channel.
-# Must be used inside a support ticket channel. Mirrors /win and /multi dropdowns exactly.
-# =========================
-
 @tree.command(name="send", description="Send a single prize prompt into this support ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     prop_firm="Prop firm — or select 'Unknown Prize' if prize is not yet known",
@@ -3110,7 +3607,6 @@ async def send_prompt(
     prize = resolved["display_name"]
     qty_text = f" (x{quantity})" if quantity > 1 else ""
 
-    # Build the same header + prompt body that /win generates
     header_lines = [f"**Prize:** {prize}{qty_text}"]
     if show:
         header_lines.append(f"**Show:** {show}")
@@ -3201,7 +3697,6 @@ async def multisend_prompt(
 
     await interaction.response.defer(ephemeral=True)
 
-    # Build the same combined header that /multi generates
     header_lines = ["**Prizes Won:**"] + [f"- {p}" for p in selected_prizes]
     if show:
         header_lines.append(f"**Show:** {show}")
@@ -3209,7 +3704,6 @@ async def multisend_prompt(
         header_lines.append(f"**Code:** `{code}`")
     await channel.send("\n".join(header_lines))
 
-    # Send a labeled prompt block for each prize, separated by a divider
     prompt_blocks = [f"## {p}\n{get_prompt_for_prize(p, show=show)}" for p in selected_prizes]
     prompt_body = "\n\n---\n\n".join(prompt_blocks)
     await send_long_message(channel, prompt_body)
