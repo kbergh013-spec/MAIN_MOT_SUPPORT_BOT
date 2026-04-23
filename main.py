@@ -1645,6 +1645,28 @@ def set_ticket_last_activity(ticket_channel_id: str, when: datetime | None = Non
     )
 
 
+async def get_last_opener_activity(channel: discord.TextChannel, opener_id: str | None) -> datetime:
+    """
+    Scan the last 100 messages in a ticket channel and return the timestamp
+    of the most recent message sent by the ticket opener.
+    Falls back to channel creation date if no opener message is found.
+    Always returns a naive UTC datetime.
+    """
+    last = channel.created_at.replace(tzinfo=None)
+    if not opener_id:
+        return last
+    try:
+        async for msg in channel.history(limit=100, oldest_first=False):
+            if msg.author.bot:
+                continue
+            if str(msg.author.id) == str(opener_id):
+                last = msg.created_at.replace(tzinfo=None)
+                break  # history is newest-first so first match is the most recent
+    except Exception as e:
+        print(f"[INACTIVITY] Could not scan history for #{channel.name}: {e}")
+    return last
+
+
 def _insert_support_ticket_row(
     user_id: str,
     user_name: str,
@@ -1895,8 +1917,10 @@ async def _inactivity_loop():
                         continue
                     # Found an open ticket channel with no DB row — insert one now
                     uid, uname = extract_user_from_channel(channel, guild)
-                    created_naive = channel.created_at.replace(tzinfo=None)
-                    timestamp = created_naive.strftime("%Y-%m-%d %H:%M:%S")
+                    # Use last opener message timestamp instead of channel creation date
+                    # so we don't immediately warn tickets where the user already replied
+                    last_active = await get_last_opener_activity(channel, uid)
+                    timestamp = last_active.strftime("%Y-%m-%d %H:%M:%S")
                     # Try to extract ticket number from channel name (e.g. 13052-username)
                     try:
                         tnum = int(channel.name.split("-")[0])
@@ -1911,7 +1935,7 @@ async def _inactivity_loop():
                         channel.name,
                         tnum,
                         timestamp,
-                        created_naive,
+                        last_active,
                     )
                     print(f"[INACTIVITY] Backfilled missing DB row for #{channel.name}")
                     known_channel_ids.add(str(channel.id))
@@ -1943,17 +1967,14 @@ async def _inactivity_loop():
                 # ── Determine last activity time ──────────────────────────────
                 last_activity = row.get("last_activity_at")
                 if last_activity is None:
-                    # No activity recorded yet.  Backfill using the channel's
-                    # creation time so old tickets don't get warned on first boot.
-                    # channel.created_at is UTC-aware; we need a naive UTC datetime
-                    # to compare with datetime.utcnow().
-                    created_naive = channel.created_at.replace(tzinfo=None)
+                    # No activity recorded yet. Scan channel history for the last
+                    # opener message so we don't warn tickets where the user replied.
+                    last_activity = await get_last_opener_activity(channel, user_id_str)
                     await asyncio.to_thread(
                         update_ticket_inactivity_fields,
                         channel_id_str,
-                        last_activity_at=created_naive,
+                        last_activity_at=last_activity,
                     )
-                    last_activity = created_naive
 
                 # Normalize: strip tzinfo if tz-aware (DB may return aware datetimes)
                 if hasattr(last_activity, "tzinfo") and last_activity.tzinfo is not None:
@@ -4448,6 +4469,61 @@ class TranscriptViewButton(discord.ui.Button):
         await interaction.response.send_message(chunks[0], ephemeral=True)
         for chunk in chunks[1:]:
             await interaction.followup.send(chunk, ephemeral=True)
+
+
+@tree.command(name="keepopen", description="Disable auto-close for this ticket", guild=discord.Object(id=GUILD_ID))
+async def keepopen(interaction: discord.Interaction):
+    if not await ensure_mod(interaction):
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
+        return
+    is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
+    if not is_ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    await asyncio.to_thread(
+        update_ticket_inactivity_fields,
+        str(channel.id),
+        auto_close_disabled=True,
+        auto_close_disabled_by=interaction.user.name,
+        auto_close_disabled_at=datetime.utcnow(),
+    )
+    await interaction.response.send_message(
+        f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
+        "It will remain open until manually deleted.",
+        ephemeral=False
+    )
+
+
+@tree.command(name="cancelkeepopen", description="Re-enable auto-close for this ticket and reset the inactivity timer", guild=discord.Object(id=GUILD_ID))
+async def cancelkeepopen(interaction: discord.Interaction):
+    if not await ensure_mod(interaction):
+        return
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
+        return
+    is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
+    if not is_ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    now = datetime.utcnow()
+    await asyncio.to_thread(
+        update_ticket_inactivity_fields,
+        str(channel.id),
+        auto_close_disabled=False,
+        auto_close_disabled_by=None,
+        auto_close_disabled_at=None,
+        last_activity_at=now,
+        clear_warning=True,
+    )
+    await interaction.response.send_message(
+        f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
+        f"The inactivity timer has been reset — ticket will warn after {INACTIVITY_WARN_HOURS}h of inactivity.",
+        ephemeral=False
+    )
 
 
 @tree.command(name="stats", description="Show giveaway stats by show and prize type", guild=discord.Object(id=GUILD_ID))
