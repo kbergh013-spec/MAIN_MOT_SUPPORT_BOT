@@ -1880,6 +1880,45 @@ async def _inactivity_loop():
             rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
             now_utc = datetime.utcnow()
 
+            # ── Backfill: insert DB rows for any open ticket channels that have
+            # no winners row yet (e.g. support tickets opened before this deploy).
+            # We collect known channel IDs first, then scan Discord channels.
+            known_channel_ids = {r["ticket_channel_id"] for r in rows if r.get("ticket_channel_id")}
+            for guild in bot.guilds:
+                for channel in guild.text_channels:
+                    if channel.name.startswith("closed-"):
+                        continue
+                    if str(channel.id) in known_channel_ids:
+                        continue
+                    is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
+                    if not is_ticket:
+                        continue
+                    # Found an open ticket channel with no DB row — insert one now
+                    uid, uname = extract_user_from_channel(channel, guild)
+                    created_naive = channel.created_at.replace(tzinfo=None)
+                    timestamp = created_naive.strftime("%Y-%m-%d %H:%M:%S")
+                    # Try to extract ticket number from channel name (e.g. 13052-username)
+                    try:
+                        tnum = int(channel.name.split("-")[0])
+                    except (ValueError, IndexError):
+                        tnum = None
+                    await asyncio.to_thread(
+                        _insert_support_ticket_row,
+                        uid or "",
+                        uname or channel.name,
+                        guild.name,
+                        str(channel.id),
+                        channel.name,
+                        tnum,
+                        timestamp,
+                        created_naive,
+                    )
+                    print(f"[INACTIVITY] Backfilled missing DB row for #{channel.name}")
+                    known_channel_ids.add(str(channel.id))
+
+            # Re-fetch rows now that backfill may have added new ones
+            rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
+
             for row in rows:
                 channel_id_str = row.get("ticket_channel_id")
                 if not channel_id_str:
@@ -4453,6 +4492,86 @@ async def stats(interaction: discord.Interaction):
         await interaction.followup.send(message[2000:], ephemeral=True)
     else:
         await interaction.response.send_message(message, ephemeral=True)
+
+
+@tree.command(name="inactivity", description="Show open tickets sorted by inactivity — see who is close to auto-delete", guild=discord.Object(id=GUILD_ID))
+async def inactivity(interaction: discord.Interaction):
+    if not await ensure_mod(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
+    if not rows:
+        await interaction.followup.send("No open tickets being tracked.", ephemeral=True)
+        return
+
+    now_utc = datetime.utcnow()
+    entries = []
+
+    for row in rows:
+        channel_id_str = row.get("ticket_channel_id")
+        if not channel_id_str:
+            continue
+        try:
+            channel = bot.get_channel(int(channel_id_str))
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(channel, discord.TextChannel):
+            continue
+        if channel.name.startswith("closed-"):
+            continue
+
+        last_activity = row.get("last_activity_at")
+        if last_activity is None:
+            last_activity = channel.created_at.replace(tzinfo=None)
+        elif hasattr(last_activity, "tzinfo") and last_activity.tzinfo is not None:
+            last_activity = last_activity.replace(tzinfo=None)
+
+        hours_inactive = (now_utc - last_activity).total_seconds() / 3600
+        warning_sent = row.get("inactivity_warning_sent_at") is not None
+        auto_close_disabled = bool(row.get("auto_close_disabled", False))
+
+        entries.append({
+            "channel": channel,
+            "hours_inactive": hours_inactive,
+            "warning_sent": warning_sent,
+            "auto_close_disabled": auto_close_disabled,
+            "user_id": row.get("user_id"),
+        })
+
+    if not entries:
+        await interaction.followup.send("No open tickets found in Discord.", ephemeral=True)
+        return
+
+    # Sort by most inactive first
+    entries.sort(key=lambda e: e["hours_inactive"], reverse=True)
+
+    lines = [f"**Open Ticket Inactivity** ({len(entries)} tickets)\n"]
+    for e in entries:
+        h = e["hours_inactive"]
+        channel = e["channel"]
+        user_mention = f"<@{e['user_id']}>" if e["user_id"] else "Unknown"
+
+        if e["auto_close_disabled"]:
+            status = "🔓 auto-close disabled"
+        elif e["warning_sent"]:
+            hours_left = max(0, INACTIVITY_CLOSE_AFTER_WARN_HOURS - (h - INACTIVITY_WARN_HOURS))
+            status = f"⚠️ warned — deletes in ~{hours_left:.1f}h"
+        elif h >= INACTIVITY_WARN_HOURS * 0.75:
+            hours_left = max(0, INACTIVITY_WARN_HOURS - h)
+            status = f"🟡 warning in ~{hours_left:.1f}h"
+        else:
+            status = "🟢 ok"
+
+        lines.append(f"{channel.mention} {user_mention} — inactive **{h:.1f}h** — {status}")
+
+    message = "\n".join(lines)
+    if len(message) > 2000:
+        await interaction.followup.send(message[:2000], ephemeral=True)
+        await interaction.followup.send(message[2000:4000], ephemeral=True)
+    else:
+        await interaction.followup.send(message, ephemeral=True)
 
 
 # =========================
