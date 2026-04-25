@@ -844,12 +844,6 @@ def is_mot_indicator(prop_firm: str) -> bool:
     return prop_firm.strip() == MOT_INDICATOR_LABEL
 
 def make_mot_indicator_resolved(duration: str) -> dict:
-    """
-    Build a resolved-prize dict for an MOT Indicator selection.
-    display_name mirrors what get_prompt_for_prize() already expects
-    (it checks p.startswith("MOT Indicator")).
-    All catalog IDs are None — MOT Indicators are not in the prop-firm catalog.
-    """
     display_name = f"MOT Indicator {duration}"
     return {
         "display_name": display_name,
@@ -1679,20 +1673,18 @@ def _insert_support_ticket_row(
 ):
     """
     Insert a minimal winners row for a panel-opened support ticket so the
-    inactivity loop can find and track it.  All prize/mod fields are None —
-    this row exists purely for inactivity tracking purposes.
+    inactivity loop can find and track it.
     Idempotent: if a row already exists for this channel it is left untouched.
     """
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                # Only insert if no row exists for this channel yet
                 cur.execute(
                     "SELECT 1 FROM winners WHERE ticket_channel_id = %s LIMIT 1",
                     (ticket_channel_id,)
                 )
                 if cur.fetchone() is not None:
-                    return  # Already tracked — nothing to do
+                    return
                 cur.execute("""
                     INSERT INTO winners (
                         timestamp, user_id, user_name, server, source, status, type,
@@ -1724,7 +1716,6 @@ class InactivityControlView(discord.ui.View):
     """
     Mod-only buttons that appear in the inactivity warning message.
     Persists across bot restarts because it is registered with add_view().
-    custom_ids must be globally unique and stable.
     """
 
     def __init__(self):
@@ -1756,6 +1747,9 @@ class InactivityControlView(discord.ui.View):
             auto_close_disabled_at=datetime.utcnow(),
         )
 
+        print(f"[INACTIVITY] Keep Open button pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=True written to DB")
+
         await interaction.response.send_message(
             f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
             "The ticket will remain open until manually closed or deleted.",
@@ -1780,7 +1774,6 @@ class InactivityControlView(discord.ui.View):
             await interaction.response.send_message("❌ Must be used inside a ticket channel.", ephemeral=True)
             return
 
-        # Re-enable auto-close and restart the inactivity timer from now.
         now = datetime.utcnow()
         await asyncio.to_thread(
             update_ticket_inactivity_fields,
@@ -1791,6 +1784,9 @@ class InactivityControlView(discord.ui.View):
             last_activity_at=now,
             clear_warning=True,
         )
+
+        print(f"[INACTIVITY] Re-enable Auto-Close pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=False written to DB")
 
         await interaction.response.send_message(
             f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
@@ -1814,7 +1810,6 @@ async def _delete_ticket_channel(channel: discord.TextChannel, reason: str):
         return  # Already closed/deleted — idempotent
 
     try:
-        # Determine ticket type and user info for the transcript
         is_giveaway = is_giveaway_ticket_channel(channel)
         is_support = is_support_ticket_channel(channel)
         ticket_type = "giveaway" if is_giveaway else ("support" if is_support else "manual")
@@ -1825,17 +1820,13 @@ async def _delete_ticket_channel(channel: discord.TextChannel, reason: str):
         uid = entries[0].get("user_id") if entries else None
         uname = entries[0].get("user") if entries else None
 
-        # Fall back to channel topic for panel support tickets
         if uid is None and guild:
             uid, uname = extract_user_from_channel(channel, guild)
 
-        # Notify before deleting so the user sees it if they're watching
         await channel.send(
             "🗑️ This ticket is being automatically deleted due to inactivity."
         )
 
-        # Save transcript using a sentinel Member-like object isn't possible from
-        # a background task — pass a string label instead via the deleted_by field
         try:
             messages = []
             async for msg in channel.history(limit=None, oldest_first=True):
@@ -1883,15 +1874,19 @@ async def _delete_ticket_channel(channel: discord.TextChannel, reason: str):
 async def _inactivity_loop():
     """
     Runs every INACTIVITY_CHECK_INTERVAL_SECONDS.
-    Uses the DB as source of truth — never scans Discord channels blindly.
+
+    FIX: auto_close_disabled (keep_open) is now checked at the TOP of each
+    ticket's processing block, before either the warning or the auto-close
+    branch runs.  Previously the flag was only checked inside Branch 2
+    (after a warning had already been sent), so tickets with keep_open=true
+    were still receiving the 24-hour warning message.
 
     Logic per ticket:
-      1. If last_activity_at is NULL → treat ticket creation timestamp as
-         last activity (backfill so old tickets aren't immediately warned).
-      2. If inactive for >= INACTIVITY_WARN_HOURS and no warning sent yet
-         → send warning message + stamp inactivity_warning_sent_at.
-      3. If warning already sent AND grace period (INACTIVITY_CLOSE_AFTER_WARN_HOURS)
-         has elapsed AND auto_close_disabled is false
+      0. If auto_close_disabled=True → log and skip entirely (FIXED).
+      1. If last_activity_at is NULL → backfill from channel history.
+      2. If inactive >= INACTIVITY_WARN_HOURS and no warning sent yet
+         → send warning and stamp inactivity_warning_sent_at.
+      3. If warning already sent AND grace period elapsed
          → auto-close the channel.
     """
     await bot.wait_until_ready()
@@ -1904,7 +1899,6 @@ async def _inactivity_loop():
 
             # ── Backfill: insert DB rows for any open ticket channels that have
             # no winners row yet (e.g. support tickets opened before this deploy).
-            # We collect known channel IDs first, then scan Discord channels.
             known_channel_ids = {r["ticket_channel_id"] for r in rows if r.get("ticket_channel_id")}
             for guild in bot.guilds:
                 for channel in guild.text_channels:
@@ -1915,13 +1909,9 @@ async def _inactivity_loop():
                     is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
                     if not is_ticket:
                         continue
-                    # Found an open ticket channel with no DB row — insert one now
                     uid, uname = extract_user_from_channel(channel, guild)
-                    # Use last opener message timestamp instead of channel creation date
-                    # so we don't immediately warn tickets where the user already replied
                     last_active = await get_last_opener_activity(channel, uid)
                     timestamp = last_active.strftime("%Y-%m-%d %H:%M:%S")
-                    # Try to extract ticket number from channel name (e.g. 13052-username)
                     try:
                         tnum = int(channel.name.split("-")[0])
                     except (ValueError, IndexError):
@@ -1948,7 +1938,6 @@ async def _inactivity_loop():
                 if not channel_id_str:
                     continue
 
-                # Resolve Discord channel — skip if not found (already deleted)
                 try:
                     channel_id_int = int(channel_id_str)
                 except ValueError:
@@ -1956,19 +1945,29 @@ async def _inactivity_loop():
 
                 channel = bot.get_channel(channel_id_int)
                 if not isinstance(channel, discord.TextChannel):
-                    continue  # Channel gone — nothing to do
+                    continue
 
-                # Skip closed channels (someone manually closed it already)
                 if channel.name.startswith("closed-"):
                     continue
 
                 user_id_str = row.get("user_id")
+                auto_close_disabled = bool(row.get("auto_close_disabled", False))
+
+                # ── Task 5: log the keep_open value as read from DB on every sweep ──
+                print(f"[INACTIVITY] Checking #{channel.name} (channel_id={channel_id_str}): "
+                      f"auto_close_disabled={auto_close_disabled} (read from DB)")
+
+                # ── FIX (Tasks 2 & 6): skip ALL inactivity logic for keep_open tickets.
+                # This guard now runs BEFORE both the warning branch and the
+                # auto-close branch, so keep_open tickets are never warned or closed.
+                if auto_close_disabled:
+                    print(f"[INACTIVITY] #{channel.name}: keep_open=True — "
+                          f"skipping warning and auto-close entirely")
+                    continue
 
                 # ── Determine last activity time ──────────────────────────────
                 last_activity = row.get("last_activity_at")
                 if last_activity is None:
-                    # No activity recorded yet. Scan channel history for the last
-                    # opener message so we don't warn tickets where the user replied.
                     last_activity = await get_last_opener_activity(channel, user_id_str)
                     await asyncio.to_thread(
                         update_ticket_inactivity_fields,
@@ -1976,7 +1975,6 @@ async def _inactivity_loop():
                         last_activity_at=last_activity,
                     )
 
-                # Normalize: strip tzinfo if tz-aware (DB may return aware datetimes)
                 if hasattr(last_activity, "tzinfo") and last_activity.tzinfo is not None:
                     last_activity = last_activity.replace(tzinfo=None)
 
@@ -1986,14 +1984,12 @@ async def _inactivity_loop():
                 if warning_sent_at is not None and hasattr(warning_sent_at, "tzinfo") and warning_sent_at.tzinfo is not None:
                     warning_sent_at = warning_sent_at.replace(tzinfo=None)
 
-                auto_close_disabled = bool(row.get("auto_close_disabled", False))
-
                 # ── Branch 1: Warning not yet sent ───────────────────────────
+                # auto_close_disabled=False is guaranteed here (guarded above).
                 if warning_sent_at is None:
                     if hours_inactive >= INACTIVITY_WARN_HOURS:
                         user_mention = f"<@{user_id_str}>" if user_id_str else "Hello"
                         try:
-                            # Plain text warning — no buttons, no pings
                             await channel.send(
                                 f"{user_mention} This ticket has been inactive for "
                                 f"{INACTIVITY_WARN_HOURS} hours and will automatically be deleted in "
@@ -2008,11 +2004,9 @@ async def _inactivity_loop():
                         except Exception as e:
                             print(f"[INACTIVITY] Could not send warning to #{channel.name}: {e}")
 
-                # ── Branch 2: Warning sent, grace period may have elapsed ────
+                # ── Branch 2: Warning sent, check grace period ────────────────
+                # auto_close_disabled=False is guaranteed here (guarded above).
                 else:
-                    if auto_close_disabled:
-                        continue  # Mod explicitly kept it open — respect that
-
                     hours_since_warning = (now_utc - warning_sent_at).total_seconds() / 3600
                     if hours_since_warning >= INACTIVITY_CLOSE_AFTER_WARN_HOURS:
                         print(f"[INACTIVITY] Auto-deleting #{channel.name} "
@@ -2103,7 +2097,6 @@ class UpdatePrizeFirmSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         firm = self.values[0]
-        # MOT Indicator uses hardcoded durations, not DB account types
         if is_mot_indicator(firm):
             types = [{"name": d} for d in MOT_INDICATOR_DURATIONS]
         else:
@@ -2136,7 +2129,6 @@ class UpdatePrizeTypeSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         account_type = self.values[0]
-        # MOT Indicator has no account size — skip straight to confirm
         if is_mot_indicator(self.firm):
             resolved = make_mot_indicator_resolved(account_type)
             new_prize = resolved["display_name"]
@@ -2447,6 +2439,8 @@ class GiveawayTicketControls(discord.ui.View):
             auto_close_disabled_by=interaction.user.name,
             auto_close_disabled_at=datetime.utcnow(),
         )
+        print(f"[INACTIVITY] Keep Open button pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=True written to DB")
         await interaction.response.send_message(
             f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
             "The ticket will remain open until manually closed or deleted.",
@@ -2472,6 +2466,8 @@ class GiveawayTicketControls(discord.ui.View):
             last_activity_at=now,
             clear_warning=True,
         )
+        print(f"[INACTIVITY] Re-enable Auto-Close pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=False written to DB")
         await interaction.response.send_message(
             f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
             f"The inactivity timer has been reset — the ticket will warn again after "
@@ -2948,6 +2944,8 @@ class SupportTicketControls(discord.ui.View):
             auto_close_disabled_by=interaction.user.name,
             auto_close_disabled_at=datetime.utcnow(),
         )
+        print(f"[INACTIVITY] Keep Open button pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=True written to DB")
         await interaction.response.send_message(
             f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
             "The ticket will remain open until manually closed or deleted.",
@@ -2973,6 +2971,8 @@ class SupportTicketControls(discord.ui.View):
             last_activity_at=now,
             clear_warning=True,
         )
+        print(f"[INACTIVITY] Re-enable Auto-Close pressed by {interaction.user.name} "
+              f"in #{channel.name} — auto_close_disabled=False written to DB")
         await interaction.response.send_message(
             f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
             f"The inactivity timer has been reset — the ticket will warn again after "
@@ -3066,9 +3066,6 @@ class OpenSupportTicketView(discord.ui.View):
                 view=FaqCategoryView()
             )
 
-            # Insert a minimal winners row so the inactivity loop can track
-            # this ticket. Panel-opened support tickets have no winners row by
-            # default — without this they are invisible to the inactivity system.
             now_utc = datetime.utcnow()
             timestamp = now_utc.strftime("%Y-%m-%d %H:%M:%S")
             await asyncio.to_thread(
@@ -3209,7 +3206,6 @@ async def create_manual_ticket(
     data["winners"].append(entry)
     save_data(data)
 
-    # ── NEW: seed last_activity_at so inactivity timer starts from creation
     now_utc = datetime.utcnow()
     await asyncio.to_thread(
         update_ticket_inactivity_fields,
@@ -3348,7 +3344,6 @@ async def create_giveaway_ticket_and_log(
         data["winners"].append(entry)
     save_data(data)
 
-    # ── NEW: seed last_activity_at so inactivity timer starts from creation
     now_utc = datetime.utcnow()
     await asyncio.to_thread(
         update_ticket_inactivity_fields,
@@ -3369,11 +3364,9 @@ class GiveawayBot(commands.Bot):
         self.add_view(SupportTicketControls())
         self.add_view(OpenSupportTicketView())
         self.add_view(FaqCategoryView())
-        # NEW: register InactivityControlView so its buttons survive restarts
         self.add_view(InactivityControlView())
         self.loop.create_task(self._safe_ensure_support_panel())
         self.loop.create_task(self._cleanup_loop())
-        # NEW: start inactivity background task
         self.loop.create_task(_inactivity_loop())
 
     async def _safe_ensure_support_panel(self):
@@ -3428,21 +3421,8 @@ tree = bot.tree
 
 @bot.event
 async def on_message(message: discord.Message):
-    """
-    Reset the inactivity timer whenever the ticket opener sends a message
-    in their own ticket channel.
-
-    Rules:
-    - Ignore bot messages (prevents the warning message itself from resetting the timer)
-    - Only act inside ticket channels that are tracked in the DB
-    - Only reset when the author is the ticket opener (user_id stored in channel topic
-      for support tickets, or in winners table for giveaway/manual tickets)
-    - Always call process_commands so prefix commands still work
-    """
-    # Let commands run regardless
     await bot.process_commands(message)
 
-    # Ignore bot messages
     if message.author.bot:
         return
 
@@ -3450,38 +3430,31 @@ async def on_message(message: discord.Message):
     if not isinstance(channel, discord.TextChannel):
         return
 
-    # Only act inside ticket channels
     is_ticket = is_support_ticket_channel(channel) or is_bot_ticket_channel(channel)
     if not is_ticket:
         return
 
-    # Skip closed tickets — no point updating an already-closed channel
     if channel.name.startswith("closed-"):
         return
 
-    # Resolve the ticket opener's user ID
     opener_id: str | None = None
 
-    # Support / manual tickets store user_id in the channel topic
     if channel.topic and channel.topic.startswith("user_id:"):
         raw = channel.topic.split("user_id:")[1].strip()
         if raw.isdigit():
             opener_id = raw
 
-    # Giveaway tickets store user_id in the winners table
     if opener_id is None:
         entries = find_entries_for_channel(channel)
         if entries:
             opener_id = entries[0].get("user_id")
 
     if opener_id is None:
-        return  # Can't determine opener — skip
+        return
 
-    # Only reset when the message author is the opener
     if str(message.author.id) != str(opener_id):
         return
 
-    # Stamp last_activity_at and clear any pending warning
     await asyncio.to_thread(
         set_ticket_last_activity,
         str(channel.id),
@@ -4490,6 +4463,8 @@ async def keepopen(interaction: discord.Interaction):
         auto_close_disabled_by=interaction.user.name,
         auto_close_disabled_at=datetime.utcnow(),
     )
+    print(f"[INACTIVITY] /keepopen used by {interaction.user.name} in #{channel.name} — "
+          f"auto_close_disabled=True written to DB")
     await interaction.response.send_message(
         f"✅ Auto-close has been **disabled** for this ticket by {interaction.user.mention}. "
         "It will remain open until manually deleted.",
@@ -4519,6 +4494,8 @@ async def cancelkeepopen(interaction: discord.Interaction):
         last_activity_at=now,
         clear_warning=True,
     )
+    print(f"[INACTIVITY] /cancelkeepopen used by {interaction.user.name} in #{channel.name} — "
+          f"auto_close_disabled=False written to DB")
     await interaction.response.send_message(
         f"✅ Auto-close has been **re-enabled** by {interaction.user.mention}. "
         f"The inactivity timer has been reset — ticket will warn after {INACTIVITY_WARN_HOURS}h of inactivity.",
@@ -4610,7 +4587,6 @@ async def inactivity(interaction: discord.Interaction):
         await interaction.followup.send("No open tickets found in Discord.", ephemeral=True)
         return
 
-    # Sort by most inactive first
     entries.sort(key=lambda e: e["hours_inactive"], reverse=True)
 
     lines = [f"**Open Ticket Inactivity** ({len(entries)} tickets)\n"]
