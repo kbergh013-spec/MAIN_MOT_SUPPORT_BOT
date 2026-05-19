@@ -211,8 +211,6 @@ def init_db():
 
             # -------------------------
             # NEW: Inactivity tracking columns
-            # These are safe to add at any time — all default to NULL so existing
-            # rows are unaffected and the checker treats NULL as "not yet active".
             # -------------------------
             cur.execute("""
                 ALTER TABLE winners
@@ -837,7 +835,6 @@ def make_unknown_resolved() -> dict:
 # MOT INDICATOR HELPER
 # =========================
 MOT_INDICATOR_LABEL = "MOT Indicator"
-# The two valid durations mods can pick — shown as the "account_type" step.
 MOT_INDICATOR_DURATIONS = ["Weekly", "Monthly"]
 
 def is_mot_indicator(prop_firm: str) -> bool:
@@ -910,7 +907,7 @@ def get_prompt_for_prize(prize: str, show: str | None = None) -> str:
                 return render_prompt(prompt_key, show=show, size=size)
             elif not has_account_type and len(parts) == 0:
                 return render_prompt(prompt_key, show=show)
-    
+
     return (
         f"🎉 **Congratulations!**\n\n"
         f"You won **{prize}**.\n\n"
@@ -1548,15 +1545,6 @@ async def mark_channel_entries_completed(channel: discord.TextChannel):
 # =========================
 
 def get_open_tickets_for_inactivity_check() -> list[dict]:
-    """
-    Return one representative row per open ticket that is eligible for
-    inactivity processing.  We deduplicate by ticket_channel_id because a
-    single ticket may have multiple rows in winners (multi-prize bundles).
-
-    Returned columns:
-        ticket_channel_id, user_id, last_activity_at,
-        inactivity_warning_sent_at, auto_close_disabled
-    """
     try:
         with get_db() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -1588,12 +1576,6 @@ def update_ticket_inactivity_fields(
     auto_close_disabled_by: str | None = None,
     auto_close_disabled_at: datetime | None = None,
 ):
-    """
-    Surgically update only the inactivity columns for every winners row that
-    belongs to this channel.  Pass clear_warning=True to NULL-out
-    inactivity_warning_sent_at (used when the opener replies and we restart
-    the cycle).
-    """
     try:
         set_clauses = []
         params: list = []
@@ -1634,7 +1616,6 @@ def update_ticket_inactivity_fields(
 
 
 def set_ticket_last_activity(ticket_channel_id: str, when: datetime | None = None):
-    """Convenience wrapper: stamp last_activity_at and clear any warning."""
     update_ticket_inactivity_fields(
         ticket_channel_id,
         last_activity_at=when or datetime.utcnow(),
@@ -1643,12 +1624,6 @@ def set_ticket_last_activity(ticket_channel_id: str, when: datetime | None = Non
 
 
 async def get_last_opener_activity(channel: discord.TextChannel, opener_id: str | None) -> datetime:
-    """
-    Scan the last 100 messages in a ticket channel and return the timestamp
-    of the most recent message sent by the ticket opener.
-    Falls back to channel creation date if no opener message is found.
-    Always returns a naive UTC datetime.
-    """
     last = channel.created_at.replace(tzinfo=None)
     if not opener_id:
         return last
@@ -1658,7 +1633,7 @@ async def get_last_opener_activity(channel: discord.TextChannel, opener_id: str 
                 continue
             if str(msg.author.id) == str(opener_id):
                 last = msg.created_at.replace(tzinfo=None)
-                break  # history is newest-first so first match is the most recent
+                break
     except Exception as e:
         print(f"[INACTIVITY] Could not scan history for #{channel.name}: {e}")
     return last
@@ -1674,11 +1649,6 @@ def _insert_support_ticket_row(
     timestamp: str,
     now_utc: datetime,
 ):
-    """
-    Insert a minimal winners row for a panel-opened support ticket so the
-    inactivity loop can find and track it.
-    Idempotent: if a row already exists for this channel it is left untouched.
-    """
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
@@ -1712,15 +1682,10 @@ def _insert_support_ticket_row(
 
 
 # =========================
-# INACTIVITY CONTROL VIEW  (persistent — registered in setup_hook)
+# INACTIVITY CONTROL VIEW
 # =========================
 
 class InactivityControlView(discord.ui.View):
-    """
-    Mod-only buttons that appear in the inactivity warning message.
-    Persists across bot restarts because it is registered with add_view().
-    """
-
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1800,17 +1765,12 @@ class InactivityControlView(discord.ui.View):
 
 
 # =========================
-# DELETE TICKET HELPER (reused by inactivity loop)
+# DELETE TICKET HELPER
 # =========================
 
 async def _delete_ticket_channel(channel: discord.TextChannel, reason: str):
-    """
-    Saves a transcript then deletes the channel.
-    Called by the inactivity loop after the grace period expires and
-    auto_close_disabled is false.
-    """
     if channel.name.startswith("closed-"):
-        return  # Already closed/deleted — idempotent
+        return
 
     try:
         is_giveaway = is_giveaway_ticket_channel(channel)
@@ -1875,23 +1835,6 @@ async def _delete_ticket_channel(channel: discord.TextChannel, reason: str):
 # =========================
 
 async def _inactivity_loop():
-    """
-    Runs every INACTIVITY_CHECK_INTERVAL_SECONDS.
-
-    FIX: auto_close_disabled (keep_open) is now checked at the TOP of each
-    ticket's processing block, before either the warning or the auto-close
-    branch runs.  Previously the flag was only checked inside Branch 2
-    (after a warning had already been sent), so tickets with keep_open=true
-    were still receiving the 24-hour warning message.
-
-    Logic per ticket:
-      0. If auto_close_disabled=True → log and skip entirely (FIXED).
-      1. If last_activity_at is NULL → backfill from channel history.
-      2. If inactive >= INACTIVITY_WARN_HOURS and no warning sent yet
-         → send warning and stamp inactivity_warning_sent_at.
-      3. If warning already sent AND grace period elapsed
-         → auto-close the channel.
-    """
     await bot.wait_until_ready()
     print("[INACTIVITY] Loop started.")
 
@@ -1900,8 +1843,6 @@ async def _inactivity_loop():
             rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
             now_utc = datetime.utcnow()
 
-            # ── Backfill: insert DB rows for any open ticket channels that have
-            # no winners row yet (e.g. support tickets opened before this deploy).
             known_channel_ids = {r["ticket_channel_id"] for r in rows if r.get("ticket_channel_id")}
             for guild in bot.guilds:
                 for channel in guild.text_channels:
@@ -1933,7 +1874,6 @@ async def _inactivity_loop():
                     print(f"[INACTIVITY] Backfilled missing DB row for #{channel.name}")
                     known_channel_ids.add(str(channel.id))
 
-            # Re-fetch rows now that backfill may have added new ones
             rows = await asyncio.to_thread(get_open_tickets_for_inactivity_check)
 
             for row in rows:
@@ -1956,19 +1896,14 @@ async def _inactivity_loop():
                 user_id_str = row.get("user_id")
                 auto_close_disabled = bool(row.get("auto_close_disabled", False))
 
-                # ── Task 5: log the keep_open value as read from DB on every sweep ──
                 print(f"[INACTIVITY] Checking #{channel.name} (channel_id={channel_id_str}): "
                       f"auto_close_disabled={auto_close_disabled} (read from DB)")
 
-                # ── FIX (Tasks 2 & 6): skip ALL inactivity logic for keep_open tickets.
-                # This guard now runs BEFORE both the warning branch and the
-                # auto-close branch, so keep_open tickets are never warned or closed.
                 if auto_close_disabled:
                     print(f"[INACTIVITY] #{channel.name}: keep_open=True — "
                           f"skipping warning and auto-close entirely")
                     continue
 
-                # ── Determine last activity time ──────────────────────────────
                 last_activity = row.get("last_activity_at")
                 if last_activity is None:
                     last_activity = await get_last_opener_activity(channel, user_id_str)
@@ -1987,8 +1922,6 @@ async def _inactivity_loop():
                 if warning_sent_at is not None and hasattr(warning_sent_at, "tzinfo") and warning_sent_at.tzinfo is not None:
                     warning_sent_at = warning_sent_at.replace(tzinfo=None)
 
-                # ── Branch 1: Warning not yet sent ───────────────────────────
-                # auto_close_disabled=False is guaranteed here (guarded above).
                 if warning_sent_at is None:
                     if hours_inactive >= INACTIVITY_WARN_HOURS:
                         user_mention = f"<@{user_id_str}>" if user_id_str else "Hello"
@@ -2006,9 +1939,6 @@ async def _inactivity_loop():
                             print(f"[INACTIVITY] Warned #{channel.name} (inactive {hours_inactive:.1f}h)")
                         except Exception as e:
                             print(f"[INACTIVITY] Could not send warning to #{channel.name}: {e}")
-
-                # ── Branch 2: Warning sent, check grace period ────────────────
-                # auto_close_disabled=False is guaranteed here (guarded above).
                 else:
                     hours_since_warning = (now_utc - warning_sent_at).total_seconds() / 3600
                     if hours_since_warning >= INACTIVITY_CLOSE_AFTER_WARN_HOURS:
@@ -3946,6 +3876,12 @@ async def multisend_prompt(
     )
 
 
+# =========================
+# /yt COMMAND — FIXED
+# Defers immediately to avoid Discord's 3-second interaction timeout.
+# Uses followup.send() after defer instead of response.send_message().
+# Does NOT create a support ticket — only logs the YouTube winner.
+# =========================
 @tree.command(name="yt", description="Log a YouTube winner without creating a ticket", guild=discord.Object(id=GUILD_ID))
 @app_commands.describe(
     youtube_name="YouTube winner name or handle",
@@ -3986,42 +3922,56 @@ async def youtube(
         await interaction.response.send_message(error, ephemeral=True)
         return
 
-    prize = resolved["display_name"]
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bundle_id = uuid.uuid4().hex[:8]
-    backend_line = format_backend_log_line(youtube_name, "youtube", prize, code, show)
-    if notes:
-        backend_line += f" | Notes: {notes}"
-    backend_msg = await post_backend_log([backend_line])
-    backend_message_id = str(backend_msg.id) if backend_msg else None
-    data = load_data()
-    data["winners"].append({
-        "timestamp": timestamp,
-        "bundle_id": bundle_id,
-        "user": youtube_name,
-        "user_id": None,
-        "source": "youtube",
-        "show": show or "Unknown",
-        "prize": prize,
-        "code": code,
-        "mod": interaction.user.name,
-        "mod_id": str(interaction.user.id),
-        "channel": interaction.channel.name if interaction.channel else "Unknown",
-        "server": interaction.guild.name if interaction.guild else "Unknown",
-        "status": "waiting_for_support_ticket",
-        "notes": notes,
-        "backend_message_id": backend_message_id,
-        "prize_catalog_id": resolved["prize_catalog_id"],
-        "prop_firm_id": resolved["prop_firm_id"],
-        "account_type_id": resolved["account_type_id"],
-        "account_size_id": resolved["account_size_id"],
-        "ticket_number": None,
-    })
-    save_data(data)
-    msg = f"✅ YouTube winner logged: **{youtube_name}**\nPrize: **{prize}**\n🧾 Bundle ID: `{bundle_id}`"
-    if show:
-        msg += f"\n📺 Show: **{show}**"
-    await interaction.response.send_message(msg, ephemeral=True)
+    # FIX: Acknowledge immediately before any slow work (DB write, HTTP call to
+    # post_backend_log). Discord expires the interaction token in ~3 seconds if
+    # no acknowledgment is sent, causing error code 10062 "Unknown interaction".
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        prize = resolved["display_name"]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bundle_id = uuid.uuid4().hex[:8]
+        backend_line = format_backend_log_line(youtube_name, "youtube", prize, code, show)
+        if notes:
+            backend_line += f" | Notes: {notes}"
+        backend_msg = await post_backend_log([backend_line])
+        backend_message_id = str(backend_msg.id) if backend_msg else None
+        data = load_data()
+        data["winners"].append({
+            "timestamp": timestamp,
+            "bundle_id": bundle_id,
+            "user": youtube_name,
+            "user_id": None,
+            "source": "youtube",
+            "show": show or "Unknown",
+            "prize": prize,
+            "code": code,
+            "mod": interaction.user.name,
+            "mod_id": str(interaction.user.id),
+            "channel": interaction.channel.name if interaction.channel else "Unknown",
+            "server": interaction.guild.name if interaction.guild else "Unknown",
+            "status": "waiting_for_support_ticket",
+            "notes": notes,
+            "backend_message_id": backend_message_id,
+            "prize_catalog_id": resolved["prize_catalog_id"],
+            "prop_firm_id": resolved["prop_firm_id"],
+            "account_type_id": resolved["account_type_id"],
+            "account_size_id": resolved["account_size_id"],
+            "ticket_number": None,
+        })
+        save_data(data)
+        msg = f"✅ YouTube winner logged: **{youtube_name}**\nPrize: **{prize}**\n🧾 Bundle ID: `{bundle_id}`"
+        if show:
+            msg += f"\n📺 Show: **{show}**"
+        # FIX: Must use followup.send() after defer — response.send_message()
+        # cannot be called after the interaction has been deferred.
+        await interaction.followup.send(msg, ephemeral=True)
+    except Exception as e:
+        print(f"[ERROR] /yt command failed: {e}")
+        await interaction.followup.send(
+            "❌ Something went wrong logging the YouTube winner. Please try again.",
+            ephemeral=True
+        )
 
 
 @tree.command(name="ytmulti", description="Log a YouTube winner with multiple prizes without creating a ticket", guild=discord.Object(id=GUILD_ID))
