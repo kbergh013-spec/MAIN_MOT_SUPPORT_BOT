@@ -60,7 +60,8 @@ SHOW_OPTIONS = [
     "Power Hour",
     "Happy Hour",
     "Traders and Haters Podcast",
-    "Trading Wheels"
+    "Trading Wheels",
+    "London With Luca"
 ]
 
 # =========================
@@ -82,10 +83,13 @@ def get_show_tag_line(show: str | None) -> str:
     normalized = show.strip().lower()
     POWER_HOUR_ALIASES = {"power hour", "ph", "powerhour"}
     HAPPY_HOUR_ALIASES = {"happy hour", "hh", "happyhour"}
+    LONDON_ALIASES = {"london with luca", "london", "lwl"}
     if normalized in POWER_HOUR_ALIASES:
         return "Tag **Logan** and **Javi**."
     if normalized in HAPPY_HOUR_ALIASES:
-        return "Tag **Koach** and **Izzy**."
+        return "Tag **Koach**."
+    if normalized in LONDON_ALIASES:
+        return "Tag **Luca**."
     return "Tag **Max** and **Lama**."
 
 # =========================
