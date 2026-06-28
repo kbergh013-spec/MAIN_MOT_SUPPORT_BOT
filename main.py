@@ -4028,72 +4028,95 @@ async def ytmulti(
 ):
     if not await ensure_mod(interaction):
         return
-    if len(youtube_name) > 100:
-        await interaction.response.send_message("❌ YouTube name must be 100 characters or less.", ephemeral=True)
-        return
-    if notes and len(notes) > 500:
-        await interaction.response.send_message("❌ Notes must be 500 characters or less.", ephemeral=True)
-        return
 
-    raw_inputs = [
-        (prop_firm_1, account_type_1, account_size_1),
-        (prop_firm_2, account_type_2, account_size_2),
-    ]
-    if prop_firm_3:
-        raw_inputs.append((prop_firm_3, account_type_3, account_size_3))
+    # Acknowledge the interaction IMMEDIATELY, before any validation, DB, or
+    # HTTP work, to avoid Discord's ~3-second timeout (error 10062).
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.NotFound:
+        print("[WARN] /ytmulti: interaction expired before defer could be sent")
+        return
+    except discord.InteractionResponded:
+        pass
 
-    resolved_prizes = []
-    for pf, at, sz in raw_inputs:
-        r, error = resolve_prize(pf, at, sz)
-        if error:
-            await interaction.response.send_message(error, ephemeral=True)
+    try:
+        if len(youtube_name) > 100:
+            await interaction.followup.send("❌ YouTube name must be 100 characters or less.", ephemeral=True)
             return
-        resolved_prizes.append(r)
+        if notes and len(notes) > 500:
+            await interaction.followup.send("❌ Notes must be 500 characters or less.", ephemeral=True)
+            return
 
-    if len(resolved_prizes) < 2:
-        await interaction.response.send_message("❌ Select at least two prizes.", ephemeral=True)
-        return
+        raw_inputs = [
+            (prop_firm_1, account_type_1, account_size_1),
+            (prop_firm_2, account_type_2, account_size_2),
+        ]
+        if prop_firm_3:
+            raw_inputs.append((prop_firm_3, account_type_3, account_size_3))
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bundle_id = uuid.uuid4().hex[:8]
-    backend_lines = []
-    for r in resolved_prizes:
-        line = format_backend_log_line(youtube_name, "youtube", r["display_name"], code, show)
-        if notes:
-            line += f" | Notes: {notes}"
-        backend_lines.append(line)
-    backend_msg = await post_backend_log(backend_lines)
-    backend_message_id = str(backend_msg.id) if backend_msg else None
-    data = load_data()
-    for r in resolved_prizes:
-        data["winners"].append({
-            "timestamp": timestamp,
-            "bundle_id": bundle_id,
-            "user": youtube_name,
-            "user_id": None,
-            "source": "youtube",
-            "show": show or "Unknown",
-            "prize": r["display_name"],
-            "code": code,
-            "mod": interaction.user.name,
-            "mod_id": str(interaction.user.id),
-            "channel": interaction.channel.name if interaction.channel else "Unknown",
-            "server": interaction.guild.name if interaction.guild else "Unknown",
-            "status": "waiting_for_support_ticket",
-            "notes": notes,
-            "backend_message_id": backend_message_id,
-            "prize_catalog_id": r["prize_catalog_id"],
-            "prop_firm_id": r["prop_firm_id"],
-            "account_type_id": r["account_type_id"],
-            "account_size_id": r["account_size_id"],
-            "ticket_number": None,
-        })
-    save_data(data)
-    summary = " & ".join([r["display_name"] for r in resolved_prizes])
-    msg = f"✅ YouTube winner logged: **{youtube_name}**\nPrizes: **{summary}**\n🧾 Bundle ID: `{bundle_id}`"
-    if show:
-        msg += f"\n📺 Show: **{show}**"
-    await interaction.response.send_message(msg, ephemeral=True)
+        resolved_prizes = []
+        for pf, at, sz in raw_inputs:
+            r, error = await asyncio.to_thread(resolve_prize, pf, at, sz)
+            if error:
+                await interaction.followup.send(error, ephemeral=True)
+                return
+            resolved_prizes.append(r)
+
+        if len(resolved_prizes) < 2:
+            await interaction.followup.send("❌ Select at least two prizes.", ephemeral=True)
+            return
+
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bundle_id = uuid.uuid4().hex[:8]
+
+        backend_lines = []
+        for r in resolved_prizes:
+            line = format_backend_log_line(youtube_name, "youtube", r["display_name"], code, show)
+            if notes:
+                line += f" | Notes: {notes}"
+            backend_lines.append(line)
+        backend_msg = await post_backend_log(backend_lines)
+        backend_message_id = str(backend_msg.id) if backend_msg else None
+
+        data = await asyncio.to_thread(load_data)
+        for r in resolved_prizes:
+            data["winners"].append({
+                "timestamp": timestamp,
+                "bundle_id": bundle_id,
+                "user": youtube_name,
+                "user_id": None,
+                "source": "youtube",
+                "show": show or "Unknown",
+                "prize": r["display_name"],
+                "code": code,
+                "mod": interaction.user.name,
+                "mod_id": str(interaction.user.id),
+                "channel": interaction.channel.name if interaction.channel else "Unknown",
+                "server": interaction.guild.name if interaction.guild else "Unknown",
+                "status": "waiting_for_support_ticket",
+                "notes": notes,
+                "backend_message_id": backend_message_id,
+                "prize_catalog_id": r["prize_catalog_id"],
+                "prop_firm_id": r["prop_firm_id"],
+                "account_type_id": r["account_type_id"],
+                "account_size_id": r["account_size_id"],
+                "ticket_number": None,
+            })
+        await asyncio.to_thread(save_data, data)
+
+        summary = " & ".join([r["display_name"] for r in resolved_prizes])
+        msg = f"✅ YouTube winner logged: **{youtube_name}**\nPrizes: **{summary}**\n🧾 Bundle ID: `{bundle_id}`"
+        if show:
+            msg += f"\n📺 Show: **{show}**"
+
+        await interaction.followup.send(msg, ephemeral=True)
+
+    except Exception as e:
+        print(f"[ERROR] /ytmulti command failed: {e}")
+        try:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+        except Exception:
+            pass
 
 
 @tree.command(name="track", description="Log a Discord winner without creating a ticket", guild=discord.Object(id=GUILD_ID))
