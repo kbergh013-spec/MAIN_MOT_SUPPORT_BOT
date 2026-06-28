@@ -4125,49 +4125,73 @@ async def track(
     if not await ensure_mod(interaction):
         return
 
-    resolved, error = resolve_prize(prop_firm, account_type, account_size)
-    if error:
-        await interaction.response.send_message(error, ephemeral=True)
+    # Acknowledge the interaction IMMEDIATELY, before any DB/HTTP work,
+    # to avoid Discord's ~3-second timeout (error 10062).
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except discord.NotFound:
+        print("[WARN] /track: interaction expired before defer could be sent")
         return
+    except discord.InteractionResponded:
+        pass
 
-    prize = resolved["display_name"]
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bundle_id = uuid.uuid4().hex[:8]
-    backend_line = format_backend_log_line(user.name, "discord", prize, code, show)
-    if notes:
-        backend_line += f" | Notes: {notes}"
-    backend_msg = await post_backend_log([backend_line])
-    backend_message_id = str(backend_msg.id) if backend_msg else None
-    data = load_data()
-    data["winners"].append({
-        "timestamp": timestamp,
-        "bundle_id": bundle_id,
-        "user": user.name,
-        "user_id": str(user.id),
-        "source": "discord",
-        "show": show or "Unknown",
-        "prize": prize,
-        "code": code,
-        "mod": interaction.user.name,
-        "mod_id": str(interaction.user.id),
-        "channel": interaction.channel.name if interaction.channel else "Unknown",
-        "server": interaction.guild.name if interaction.guild else "Unknown",
-        "status": "tracked_no_ticket",
-        "notes": notes,
-        "backend_message_id": backend_message_id,
-        "prize_catalog_id": resolved["prize_catalog_id"],
-        "prop_firm_id": resolved["prop_firm_id"],
-        "account_type_id": resolved["account_type_id"],
-        "account_size_id": resolved["account_size_id"],
-        "ticket_number": None,
-    })
-    save_data(data)
-    msg = f"✅ {user.mention} tracked without opening a ticket.\nPrize: **{prize}**\n🧾 Bundle ID: `{bundle_id}`"
-    if show:
-        msg += f"\n📺 Show: **{show}**"
-    if notes:
-        msg += f"\n📝 Notes: {notes}"
-    await interaction.response.send_message(msg, ephemeral=True)
+    try:
+        resolved, error = await asyncio.to_thread(
+            resolve_prize, prop_firm, account_type, account_size
+        )
+        if error:
+            await interaction.followup.send(error, ephemeral=True)
+            return
+
+        prize = resolved["display_name"]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bundle_id = uuid.uuid4().hex[:8]
+
+        backend_line = format_backend_log_line(user.name, "discord", prize, code, show)
+        if notes:
+            backend_line += f" | Notes: {notes}"
+        backend_msg = await post_backend_log([backend_line])
+        backend_message_id = str(backend_msg.id) if backend_msg else None
+
+        data = await asyncio.to_thread(load_data)
+        data["winners"].append({
+            "timestamp": timestamp,
+            "bundle_id": bundle_id,
+            "user": user.name,
+            "user_id": str(user.id),
+            "source": "discord",
+            "show": show or "Unknown",
+            "prize": prize,
+            "code": code,
+            "mod": interaction.user.name,
+            "mod_id": str(interaction.user.id),
+            "channel": interaction.channel.name if interaction.channel else "Unknown",
+            "server": interaction.guild.name if interaction.guild else "Unknown",
+            "status": "tracked_no_ticket",
+            "notes": notes,
+            "backend_message_id": backend_message_id,
+            "prize_catalog_id": resolved["prize_catalog_id"],
+            "prop_firm_id": resolved["prop_firm_id"],
+            "account_type_id": resolved["account_type_id"],
+            "account_size_id": resolved["account_size_id"],
+            "ticket_number": None,
+        })
+        await asyncio.to_thread(save_data, data)
+
+        msg = f"✅ {user.mention} tracked without opening a ticket.\nPrize: **{prize}**\n🧾 Bundle ID: `{bundle_id}`"
+        if show:
+            msg += f"\n📺 Show: **{show}**"
+        if notes:
+            msg += f"\n📝 Notes: {notes}"
+
+        await interaction.followup.send(msg, ephemeral=True)
+
+    except Exception as e:
+        print(f"[ERROR] /track command failed: {e}")
+        try:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+        except Exception:
+            pass
 
 
 @tree.command(name="manualticket", description="Open a manual non-giveaway ticket for a member", guild=discord.Object(id=GUILD_ID))
